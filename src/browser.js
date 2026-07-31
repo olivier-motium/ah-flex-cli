@@ -402,12 +402,20 @@ async function firstVisible(locator) {
   return null;
 }
 
-async function findPdpAddButton(page) {
-  return (
-    (await firstVisible(page.locator('[data-testid="pdp-hero-basket-actions-add-to-cart-button"]'))) ??
-    (await firstVisible(
-      page.getByRole("button", { name: /^voeg toe(?: aan (?:je )?(?:winkelmand|boodschappenlijst|lijst))?$/i }),
-    ))
+const PDP_HERO_ACTIONS =
+  '[data-testid^="pdp-hero-basket-actions"], [data-testhook^="pdp-hero-basket-actions"]';
+
+export async function findPdpAddButton(page) {
+  const exact = await firstVisible(
+    page.locator(
+      '[data-testid="pdp-hero-basket-actions-add-to-cart-button"], [data-testhook="pdp-hero-basket-actions-add-to-cart-button"]',
+    ),
+  );
+  if (exact) return exact;
+  return firstVisible(
+    page
+      .locator(PDP_HERO_ACTIONS)
+      .getByRole("button", { name: /^voeg toe(?: aan (?:je )?(?:winkelmand|boodschappenlijst|lijst))?$/i }),
   );
 }
 
@@ -483,6 +491,11 @@ async function readExactProductStates(page, lines) {
   const rows = [];
   for (const line of lines) {
     const url = await gotoExactProduct(page, line.url);
+    const quantity = await readPdpQuantity(page);
+    if (Number.isInteger(quantity) && quantity >= 1) {
+      rows.push({ url, name: line.expected_name, quantity });
+      continue;
+    }
     const addButton = await findPdpAddButton(page);
     if (addButton) {
       if (!(await addButton.isEnabled())) {
@@ -490,32 +503,33 @@ async function readExactProductStates(page, lines) {
       }
       continue;
     }
-    const quantity = await readPdpQuantity(page);
-    if (!Number.isInteger(quantity) || quantity < 1) {
-      throw new BasketError(
-        `Exact product ${url} has no add button and no readable product-page quantity; refusing ambiguous cart state`,
-      );
-    }
-    rows.push({ url, name: line.expected_name, quantity });
+    throw new BasketError(
+      `Exact product ${url} has no scoped add button and no readable product-page quantity; refusing ambiguous cart state`,
+    );
   }
   return rows;
 }
 
-async function findPdpPlusButton(page) {
+export async function findPdpPlusButton(page) {
+  const hero = page.locator(PDP_HERO_ACTIONS);
   return (
     (await firstVisible(
       page.locator(
-        '[data-testid^="pdp-hero-basket-actions"][data-testid*="increase"], [data-testid^="pdp-hero-basket-actions"][data-testid*="plus"]',
+        '[data-testid^="pdp-hero-basket-actions"][data-testid*="increase"], [data-testid^="pdp-hero-basket-actions"][data-testid*="plus"], [data-testhook^="pdp-hero-basket-actions"][data-testhook*="increase"], [data-testhook^="pdp-hero-basket-actions"][data-testhook*="plus"]',
       ),
     )) ??
     (await firstVisible(
-      page.getByRole("button", { name: /^(?:verhoog(?: het)? aantal.*|plus|voeg (?:nog )?één toe|\+)$/i }),
+      hero.getByRole("button", { name: /^(?:verhoog(?: het)? aantal.*|plus|voeg (?:nog )?één toe|\+)$/i }),
     ))
   );
 }
 
 async function addExactToVisibleList(page, line) {
   const url = await gotoExactProduct(page, line.url);
+  const existingQuantity = await readPdpQuantity(page);
+  if (Number.isInteger(existingQuantity) && existingQuantity >= 1) {
+    throw new BasketError(`Exact product ${url} is already present; refusing a duplicate add`);
+  }
   const addButton = await findPdpAddButton(page);
   if (!addButton) {
     throw new BasketError(

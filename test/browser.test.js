@@ -5,6 +5,8 @@ import {
   assertAllowedAutomationUrl,
   buildApplyPlan,
   extractPdpQuantity,
+  findPdpAddButton,
+  findPdpPlusButton,
   isAllowedAutomationUrl,
   normalizeProductCandidate,
 } from "../src/browser.js";
@@ -92,6 +94,29 @@ test("PDP quantity extraction ignores blank/action controls and reads one curren
     ]),
     1,
   );
+});
+
+test("PDP control lookup ignores page-wide recommendation buttons", async () => {
+  const emptyLocator = {
+    count: async () => 0,
+    nth: () => assert.fail("empty locator has no rows"),
+    getByRole: () => emptyLocator,
+  };
+  let pageWideRoleLookups = 0;
+  const page = {
+    locator: () => emptyLocator,
+    getByRole: () => {
+      pageWideRoleLookups += 1;
+      return {
+        count: async () => 1,
+        nth: () => ({ isVisible: async () => true }),
+      };
+    },
+  };
+
+  assert.equal(await findPdpAddButton(page), null);
+  assert.equal(await findPdpPlusButton(page), null);
+  assert.equal(pageWideRoleLookups, 0);
 });
 
 test("dry-run emits exact URLs and quantities without constructing a browser adapter", () => {
