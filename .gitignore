@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+*.log
+.DS_Store
+review.html
+
+# Browser-owned session state. Never commit or inspect this directory.
+.browser-profile/
+
