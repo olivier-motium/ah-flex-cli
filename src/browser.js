@@ -1,22 +1,14 @@
-import { access, mkdir } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { chromium } from "playwright-core";
+import { firefox } from "playwright-core";
 import { assertActionableBasket, assertExactProductUrl, BasketError, calculateUnitPrice } from "./basket.js";
+import { createMemberRequestBody } from "./member-query.js";
 
 const AH_ORIGIN = "https://www.ah.be";
 const BLOCKED_PATH = /\/(?:checkout|afrekenen|bestellen|betaling|payment|order)(?:\/|$)/i;
 const ALLOWED_PATH = /^(?:\/$|\/zoeken(?:\/|$)|\/producten\/product\/|\/mijnlijst(?:\/|$)|\/mijn(?:\/|$)|\/inloggen(?:\/|$))/;
 
-const DEFAULT_BROWSER_PATHS = [
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-  "/usr/bin/google-chrome",
-  "/usr/bin/chromium",
-  "/usr/bin/chromium-browser",
-];
 const navigationGuards = new WeakMap();
+const browserOwners = new WeakMap();
+const CONSENT_COOKIE_NAMES = ["consentBeta", "consentSettings"];
 
 export function isAllowedAutomationUrl(value) {
   if (value === "about:blank") return true;
@@ -279,42 +271,133 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
   }
 }
 
-async function findBrowserExecutable(explicitPath) {
-  const candidates = [explicitPath, process.env.AH_FLEX_BROWSER, ...DEFAULT_BROWSER_PATHS].filter(Boolean);
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return candidate;
-    } catch {
-      // Try the next local browser without printing filesystem details.
+export function normalizeConsentCookies(candidates) {
+  const result = new Map();
+  for (const candidate of candidates ?? []) {
+    if (!CONSENT_COOKIE_NAMES.includes(candidate?.name)) continue;
+    if (result.has(candidate.name)) {
+      throw new BasketError("The AH consent bootstrap returned duplicate consent cookies");
     }
+    if (
+      typeof candidate.value !== "string" ||
+      !candidate.value ||
+      candidate.value.length > 4096 ||
+      /[\u0000-\u001f\u007f]/.test(candidate.value)
+    ) {
+      throw new BasketError("The AH consent bootstrap returned a malformed consent cookie");
+    }
+    result.set(candidate.name, { name: candidate.name, value: candidate.value, url: AH_ORIGIN });
   }
-  throw new BasketError(
-    "No supported Chromium browser was found. Install Chrome/Chromium or set AH_FLEX_BROWSER to its executable path",
-  );
+  const missing = CONSENT_COOKIE_NAMES.filter((name) => !result.has(name));
+  if (missing.length) {
+    throw new BasketError("The AH consent bootstrap did not produce the required privacy-choice cookies");
+  }
+  return CONSENT_COOKIE_NAMES.map((name) => result.get(name));
+}
+
+async function readConsentCookiesByName(page) {
+  return page.evaluate(async (names) => {
+    if (globalThis.cookieStore?.get) {
+      const rows = await Promise.all(
+        names.map(async (name) => {
+          const cookie = await globalThis.cookieStore.get(name);
+          return cookie ? { name, value: cookie.value } : null;
+        }),
+      );
+      return rows.filter(Boolean);
+    }
+
+    const allowed = new Set(names);
+    const rows = [];
+    for (const segment of document.cookie.split(";")) {
+      const separator = segment.indexOf("=");
+      if (separator < 1) continue;
+      const name = segment.slice(0, separator).trim();
+      if (allowed.has(name)) rows.push({ name, value: segment.slice(separator + 1) });
+    }
+    return rows;
+  }, CONSENT_COOKIE_NAMES);
+}
+
+async function waitForConsentCookies(page) {
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const candidates = await readConsentCookiesByName(page).catch(() => []);
+    if (candidates.length >= CONSENT_COOKIE_NAMES.length) return normalizeConsentCookies(candidates);
+    if (attempt < 29) await page.waitForTimeout(100).catch(() => {});
+  }
+  throw new BasketError("The AH privacy choice was not recorded; no cart action was attempted");
+}
+
+async function bootstrapConsentCookies(browser, productUrl) {
+  const context = await browser.newContext({ viewport: null, acceptDownloads: false });
+  try {
+    const page = await context.newPage();
+    await safeGoto(page, assertExactProductUrl(productUrl));
+    const popup = page.locator('[data-testid="cookie-popup"]');
+    try {
+      await popup.waitFor({ state: "visible", timeout: 8_000 });
+    } catch {
+      throw new BasketError("The AH privacy choice did not appear; no cart action was attempted");
+    }
+    const reject = await firstVisible(popup.getByRole("button", { name: /^(?:weigeren|reject)$/i }));
+    if (!reject) {
+      throw new BasketError("The AH privacy-minimal choice could not be found; no cart action was attempted");
+    }
+
+    const click = reject.click({ timeout: 8_000, noWaitAfter: true }).catch(() => {});
+    const cookies = await waitForConsentCookies(page);
+    await click;
+    return cookies;
+  } finally {
+    await context.close();
+  }
 }
 
 export async function launchVisibleAhBrowser(options = {}) {
-  const executablePath = await findBrowserExecutable(options.executablePath);
-  const profileDir =
-    options.profileDir ?? path.join(os.homedir(), "Library", "Application Support", "ah-flex-cli", "browser-profile");
-  await mkdir(profileDir, { recursive: true, mode: 0o700 });
-  const context = await chromium.launchPersistentContext(profileDir, visibleBrowserLaunchOptions(executablePath));
-
-  const navigationGuard = async (route) => {
-    const request = route.request();
-    if (request.isNavigationRequest() && request.resourceType() === "document") {
-      const target = request.url();
-      if (!isAllowedAutomationUrl(target)) {
-        await route.abort("blockedbyclient");
-        return;
+  const browser = await firefox.launch(visibleFirefoxLaunchOptions());
+  try {
+    const consentCookies = options.consentUrl
+      ? await bootstrapConsentCookies(browser, options.consentUrl)
+      : [];
+    const context = await browser.newContext({ viewport: null, acceptDownloads: false });
+    browserOwners.set(context, browser);
+    const cookies = [
+      ...(options.sessionMode === "har" ? options.harSession?.cookies ?? [] : []),
+      ...consentCookies,
+    ];
+    if (cookies.length) {
+      try {
+        await context.addCookies(cookies);
+      } catch {
+        throw new BasketError("The bounded AH browser cookies could not be loaded; no browser action was attempted");
       }
     }
-    await route.continue();
-  };
-  await context.route("**/*", navigationGuard);
-  navigationGuards.set(context, navigationGuard);
-  return context;
+
+    const navigationGuard = async (route) => {
+      const request = route.request();
+      if (request.isNavigationRequest() && request.resourceType() === "document") {
+        const target = request.url();
+        if (!isAllowedAutomationUrl(target)) {
+          await route.abort("blockedbyclient");
+          return;
+        }
+      }
+      await route.continue();
+    };
+    await context.route("**/*", navigationGuard);
+    navigationGuards.set(context, navigationGuard);
+    return context;
+  } catch (error) {
+    await browser.close();
+    throw error;
+  }
+}
+
+export async function closeVisibleAhBrowser(context) {
+  const browser = browserOwners.get(context);
+  browserOwners.delete(context);
+  if (browser) await browser.close();
+  else await context.close();
 }
 
 export async function releaseAutomationGuard(context) {
@@ -324,14 +407,20 @@ export async function releaseAutomationGuard(context) {
   navigationGuards.delete(context);
 }
 
-export function visibleBrowserLaunchOptions(executablePath) {
+export function visibleFirefoxLaunchOptions() {
   return {
-    executablePath,
+    channel: "moz-firefox",
     headless: false,
-    viewport: null,
-    acceptDownloads: false,
-    chromiumSandbox: true,
   };
+}
+
+export function assertApplySessionMode(options = {}) {
+  const isGuest = options.sessionMode === "guest" && !options.harSession;
+  const isHar = options.sessionMode === "har" && Boolean(options.harSession);
+  if (!isGuest && !isHar) {
+    throw new BasketError("Confirmed cart apply requires exactly one explicit session mode: guest or HAR");
+  }
+  return options.sessionMode;
 }
 
 async function activePage(context) {
@@ -343,6 +432,75 @@ async function safeGoto(page, value) {
   assertAllowedAutomationUrl(value);
   await page.goto(value, { waitUntil: "domcontentloaded", timeout: 30_000 });
   assertAllowedAutomationUrl(page.url());
+}
+
+async function queryMemberState(page, memberRequest, productUrl) {
+  await safeGoto(page, assertExactProductUrl(productUrl));
+  let result;
+  try {
+    result = await page.evaluate(async ({ headers, body }) => {
+      const response = await fetch("/gql", {
+        method: "POST",
+        credentials: "include",
+        headers,
+        body: JSON.stringify(body),
+      });
+      let json = null;
+      try {
+        json = await response.json();
+      } catch {
+        // Non-JSON responses cannot prove authentication.
+      }
+      const jsonObject = Boolean(json && typeof json === "object" && !Array.isArray(json));
+      const hasErrors = jsonObject && Object.prototype.hasOwnProperty.call(json, "errors");
+      const errorsClear = !hasErrors || (Array.isArray(json.errors) && json.errors.length === 0);
+      const dataObject = Boolean(jsonObject && json.data && typeof json.data === "object" && !Array.isArray(json.data));
+      const hasMember = dataObject && Object.prototype.hasOwnProperty.call(json.data, "member");
+      const member = hasMember ? json.data.member : undefined;
+      const memberState =
+        member === null
+          ? "null"
+          : member && typeof member === "object" && !Array.isArray(member)
+            ? "object"
+            : hasMember
+              ? "other"
+              : "missing";
+      return { status: response.status, jsonObject, errorsClear, hasMember, memberState };
+    }, memberRequest);
+  } catch {
+    throw new BasketError("The live AH member state could not be verified; no cart action was attempted");
+  }
+  return result;
+}
+
+export async function verifyAuthenticatedMember(page, memberRequest, productUrl) {
+  const result = await queryMemberState(page, memberRequest, productUrl);
+  if (
+    result.status !== 200 ||
+    !result.jsonObject ||
+    !result.errorsClear ||
+    !result.hasMember ||
+    result.memberState !== "object"
+  ) {
+    throw new BasketError("The HAR-backed AH session is not authenticated; no cart action was attempted");
+  }
+}
+
+export async function verifyAnonymousMember(page, productUrl) {
+  const result = await queryMemberState(
+    page,
+    { headers: { "content-type": "application/json" }, body: createMemberRequestBody() },
+    productUrl,
+  );
+  if (
+    result.status !== 200 ||
+    !result.jsonObject ||
+    !result.errorsClear ||
+    !result.hasMember ||
+    result.memberState !== "null"
+  ) {
+    throw new BasketError("The guest Firefox context is not provably anonymous; no cart action was attempted");
+  }
 }
 
 async function settle(page, options = {}) {
@@ -394,7 +552,7 @@ export async function searchProducts(query, options = {}) {
     }
     return products;
   } finally {
-    await context.close();
+    await closeVisibleAhBrowser(context);
   }
 }
 
@@ -405,6 +563,13 @@ async function firstVisible(locator) {
     if (await candidate.isVisible()) return candidate;
   }
   return null;
+}
+
+export async function assertCookiePopupAbsent(page) {
+  const popup = page.locator('[data-testid="cookie-popup"]');
+  if (await popup.isVisible().catch(() => false)) {
+    throw new BasketError("The AH privacy choice reappeared in the final browser; no cart click was attempted");
+  }
 }
 
 const PDP_HERO_ACTIONS =
@@ -479,9 +644,28 @@ async function readPdpQuantity(page) {
   return extractPdpQuantity(rawControls);
 }
 
+async function waitForPdpQuantity(page, expected, url) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    let observed = null;
+    try {
+      observed = await readPdpQuantity(page);
+    } catch {
+      // Transient duplicate controls can exist while the basket widget rerenders.
+    }
+    if (observed === expected) return;
+    if (Number.isInteger(observed) && observed > expected) {
+      throw new BasketError(`Exact product ${url} advanced past quantity ${expected} to ${observed}`);
+    }
+    if (attempt < 79) await page.waitForTimeout(100);
+  }
+  throw new BasketError(`Exact product ${url} did not reach visible quantity ${expected}`);
+}
+
 async function gotoExactProduct(page, url) {
   const exactUrl = assertExactProductUrl(url);
-  await safeGoto(page, exactUrl);
+  if (new URL(page.url()).pathname !== new URL(exactUrl).pathname) {
+    await safeGoto(page, exactUrl);
+  }
   if (new URL(page.url()).pathname !== new URL(exactUrl).pathname) {
     throw new BasketError(`Exact product navigation drifted from ${exactUrl} to ${page.url()}`);
   }
@@ -531,6 +715,7 @@ export async function findPdpPlusButton(page) {
 
 async function addExactToVisibleList(page, line) {
   const url = await gotoExactProduct(page, line.url);
+  await assertCookiePopupAbsent(page);
   const existingQuantity = await readPdpQuantity(page);
   if (Number.isInteger(existingQuantity) && existingQuantity >= 1) {
     throw new BasketError(`Exact product ${url} is already present; refusing a duplicate add`);
@@ -542,18 +727,25 @@ async function addExactToVisibleList(page, line) {
     );
   }
   if (!(await addButton.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
-  await addButton.click();
+  try {
+    await addButton.click({ timeout: 12_000 });
+  } catch {
+    throw new BasketError(`The scoped add control for exact product ${url} could not be clicked`);
+  }
   assertAllowedAutomationUrl(page.url());
-  await addButton.waitFor({ state: "hidden", timeout: 8_000 }).catch(() => {
-    throw new BasketError(`No visible cart-state transition was observed after adding exact product ${url}`);
-  });
+  await waitForPdpQuantity(page, 1, url);
 
   if (line.quantity > 1) {
     const plus = await findPdpPlusButton(page);
     if (!plus) throw new BasketError(`Quantity control for exact product ${url} could not be read`);
     for (let currentQuantity = 1; currentQuantity < line.quantity; currentQuantity += 1) {
-      await plus.click();
+      try {
+        await plus.click({ timeout: 12_000 });
+      } catch {
+        throw new BasketError(`The quantity control for exact product ${url} could not be clicked`);
+      }
       assertAllowedAutomationUrl(page.url());
+      await waitForPdpQuantity(page, currentQuantity + 1, url);
     }
   }
 }
@@ -566,20 +758,26 @@ export async function openLoginSession(options = {}) {
     await releaseAutomationGuard(context);
     return { context, page };
   } catch (error) {
-    await context.close();
+    await closeVisibleAhBrowser(context);
     throw error;
   }
 }
 
 export async function applyBasketInVisibleBrowser(basket, options = {}) {
+  const sessionMode = assertApplySessionMode(options);
   const plan = buildApplyPlan(basket, options);
-  const context = await launchVisibleAhBrowser(options);
+  const context = await launchVisibleAhBrowser({ ...options, consentUrl: plan.lines[0].url });
   const page = await activePage(context);
   const adapter = {
     read: () => readExactProductStates(page, plan.lines),
     addExact: (line) => addExactToVisibleList(page, line),
   };
   try {
+    if (sessionMode === "har") {
+      await verifyAuthenticatedMember(page, options.harSession.memberRequest, plan.lines[0].url);
+    } else {
+      await verifyAnonymousMember(page, plan.lines[0].url);
+    }
     const receipt = await applyBasketWithAdapter(basket, adapter, options);
     await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
     await releaseAutomationGuard(context);

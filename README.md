@@ -13,14 +13,24 @@ touches payment.
 ## Boundaries
 
 - This is a custom personal-use browser helper, not an official AH integration.
-- It does not call or clone AH's undocumented GraphQL or mobile APIs.
+- It does not guess or call an undocumented cart mutation API. One pinned,
+  read-only `member` query is used only to prove that the final context is
+  explicitly anonymous or authenticated before any cart click.
 - Search reads fetch the same public `www.ah.be` pages a browser loads, over
   plain HTTPS with the browser's request headers (AH-authorized browser
   mimicry; the edge otherwise answers Access Denied on `/zoeken`). Product
   facts come from the structured payload embedded in those pages, not from
   screen scraping. No cookies or session values are sent or stored for reads.
-- It never imports cookies, passwords, tokens, or session values from a HAR.
-- Login and verification stay inside a user-visible browser profile.
+- With explicit `--har`, it imports only six allowlisted AH session/routing
+  cookies into a fresh nonpersistent Firefox context. Akamai cookies are
+  excluded, values are never logged, and a live `member` query must prove the
+  session before any cart click.
+- With explicit `--guest`, a throwaway Firefox context selects **Weigeren** in
+  AH's consent dialog. Only `consentBeta` and `consentSettings` are copied into
+  a second fresh context; account, HAR, routing, and Akamai cookies are not.
+  The pinned live member query must return an explicit `null` member before the
+  guest cart can change.
+- Password entry and verification stay outside the CLI.
 - Cart/list changes are dry-run by default and require an explicit execution
   flag. Checkout and payment automation do not exist. Once exact line/quantity
   readback succeeds, browser control is released for the human handoff.
@@ -47,7 +57,7 @@ or auto-substitution engine are part of the product.
 
 ## Install
 
-Requires Node.js 20+ and a local Chrome, Chromium, or Edge installation.
+Requires Node.js 20+ and a current local Firefox installation.
 
 ```sh
 npm install
@@ -55,11 +65,10 @@ npm link
 ah-flex --help
 ```
 
-`ah-flex` stores its dedicated visible-browser profile under
-`~/Library/Application Support/ah-flex-cli/browser-profile` on macOS. Login
-cookies stay inside that browser-managed profile; the CLI does not inspect or
-export them. Set `AH_FLEX_BROWSER` only when the browser executable is in a
-non-standard location.
+Confirmed writes use stock Firefox through Playwright's WebDriver BiDi channel.
+All helper contexts are nonpersistent. Guest consent is bootstrapped entirely in
+memory, and an explicitly supplied HAR session exists only for that process;
+neither is copied into a browser profile.
 
 ## Command surface
 
@@ -70,7 +79,8 @@ ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
 ah-flex session login
 ah-flex cart apply basket.json                 # dry-run
-ah-flex cart apply basket.json --confirm-add   # visible browser writes only
+ah-flex cart apply basket.json --confirm-add --guest
+ah-flex cart apply basket.json --confirm-add --har /path/to/AH.har
 ```
 
 `search` defaults to the HTTP transport, which needs no login and no browser.
@@ -94,10 +104,14 @@ continue to login, ordering, or payment.
    into each `selected` field.
 4. Run `basket check`, generate the static review, then run `cart apply` without
    the execution flag. Unresolved, unavailable, or stale lines block apply.
-5. After reviewing the exact dry-run, `--confirm-add` opens the dedicated
-   browser, changes the winkelmandje, rereads every exact URL and quantity, and
-   hands the visible browser to the user. This confirmed command requires an
-   interactive terminal so that handoff cannot disappear into a background job.
+5. After reviewing the exact dry-run, use `--confirm-add --guest` for a fresh
+   unauthenticated cart or `--confirm-add --har ...` for a captured account
+   session. The CLI proves the live member state, changes the winkelmandje,
+   rereads every exact URL and quantity, and hands the visible browser to the
+   user. The HAR-backed path currently accepts one exact product line per run;
+   guest mode accepts the actionable basket. Confirmed commands require an
+   interactive terminal so the final browser handoff cannot disappear into a
+   background job.
 
 The checked-in chicken-and-beef example is intentionally unresolved: it is the
 recombinable component brief, not fake or stale product data.
@@ -112,27 +126,29 @@ had denied both curl and the automated browser profile on `/zoeken`. The
 browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
 denying it, refresh the pinned Chrome version there.
 
-The cart write path uses a visible browser, exact product pages,
-`--confirm-add` from an interactive terminal, and post-write readback. The first
-controlled canary stopped on an Access Denied product page before any add
-control was reached, so no real cart mutation has yet been verified. No command
-should be described as having prepared a real cart until a controlled canary
-succeeds.
+The first Chromium write canary reached an add click but could not verify the
+state transition; its partial receipt was treated as ambiguous. The completed
+Firefox guest canary on 2026-07-31 used exact product `wi481844`, added one
+`AH Tomaten passata gezeefd`, reread that exact URL at quantity `1`, and opened
+the verified `/mijnlijst` cart. The CLI receipt reported `ADDED`; the visible
+cart total was €0.59. Checkout and payment were not opened.
 
-The visible writer keeps Chromium's operating-system sandbox enabled. Besides
-being the safer browser boundary, this avoids AH denying product-page requests
-that arrive from a browser launched with Playwright's default `--no-sandbox`.
+The supplied HAR still parses against the pinned member request, but its live
+session no longer proves an authenticated member. That path therefore stops
+before any cart click, as designed. Guest mode does not read the HAR.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
 action.
 
-## Why the HAR is not a runtime dependency
+## HAR boundary
 
-The supplied capture proved that the current Belgian site uses cookie-backed
-browser sessions and exposed read-only GraphQL operations, but it contained no
-cart mutation. It is credential-bearing evidence, not configuration. No HAR
-contents are copied into this repository.
+The supplied capture contains authenticated read queries but no cart mutation,
+so the CLI never replays it or guesses a GraphQL write. `--har` uses the newest
+successful basket request only to obtain a narrow cookie allowlist and requires
+the capture to contain the exact pinned member query used by the CLI's live
+authentication check. Everything stays in memory; raw HAR content and cookie
+values never enter output, receipts, tests, or Git.
 
 The implementation is custom. Public grocery MCPs informed the generic safety
 shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or

@@ -2,14 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   applyBasketWithAdapter,
+  assertApplySessionMode,
   assertAllowedAutomationUrl,
+  assertCookiePopupAbsent,
   buildApplyPlan,
   extractPdpQuantity,
   findPdpAddButton,
   findPdpPlusButton,
   isAllowedAutomationUrl,
+  normalizeConsentCookies,
   normalizeProductCandidate,
-  visibleBrowserLaunchOptions,
+  verifyAnonymousMember,
+  verifyAuthenticatedMember,
+  visibleFirefoxLaunchOptions,
 } from "../src/browser.js";
 import { BasketError } from "../src/basket.js";
 
@@ -79,10 +84,77 @@ test("navigation guard allows only bounded AH Belgium pages and hard-blocks chec
   assert.throws(() => assertAllowedAutomationUrl("https://www.ah.be/bestellen"), /Blocked browser navigation/);
 });
 
-test("visible browser keeps the Chromium OS sandbox enabled", () => {
-  const options = visibleBrowserLaunchOptions("/Applications/Google Chrome");
-  assert.equal(options.chromiumSandbox, true);
+test("visible browser uses stock Firefox in non-headless mode", () => {
+  const options = visibleFirefoxLaunchOptions();
+  assert.equal(options.channel, "moz-firefox");
   assert.equal(options.headless, false);
+});
+
+test("confirmed browser apply requires one explicit guest or HAR session mode", () => {
+  const harSession = { cookies: [], memberRequest: {} };
+  assert.equal(assertApplySessionMode({ sessionMode: "guest" }), "guest");
+  assert.equal(assertApplySessionMode({ sessionMode: "har", harSession }), "har");
+  assert.throws(() => assertApplySessionMode({}), /exactly one explicit session mode/);
+  assert.throws(
+    () => assertApplySessionMode({ sessionMode: "guest", harSession }),
+    /exactly one explicit session mode/,
+  );
+  assert.throws(() => assertApplySessionMode({ sessionMode: "har" }), /exactly one explicit session mode/);
+});
+
+test("consent bootstrap copies only two bounded AH privacy-choice cookies", () => {
+  const cookies = normalizeConsentCookies([
+    { name: "_abck", value: "must-not-copy", domain: ".ah.be" },
+    { name: "consentSettings", value: "settings", domain: ".ah.be", expires: 99 },
+    { name: "consentBeta", value: "beta", path: "/" },
+  ]);
+  assert.deepEqual(cookies, [
+    { name: "consentBeta", value: "beta", url: "https://www.ah.be" },
+    { name: "consentSettings", value: "settings", url: "https://www.ah.be" },
+  ]);
+  assert.throws(() => normalizeConsentCookies(cookies.slice(0, 1)), /required privacy-choice cookies/);
+  assert.throws(() => normalizeConsentCookies([...cookies, cookies[0]]), /duplicate consent cookies/);
+});
+
+test("the final cart context fails closed if the consent UI reappears", async () => {
+  const page = { locator: () => ({ isVisible: async () => false }) };
+  await assertCookiePopupAbsent(page);
+  page.locator = () => ({ isVisible: async () => true });
+  await assert.rejects(() => assertCookiePopupAbsent(page), /privacy choice reappeared/);
+});
+
+test("live member verification distinguishes authenticated and explicitly anonymous contexts", async () => {
+  const memberRequest = { headers: { "content-type": "application/json" }, body: { operationName: "member" } };
+  const productUrl = "https://www.ah.be/producten/product/wi111111/exact-wi111111";
+  const page = {
+    goto: async () => {},
+    url: () => productUrl,
+    evaluate: async () => ({
+      status: 200,
+      jsonObject: true,
+      errorsClear: true,
+      hasMember: true,
+      memberState: "object",
+    }),
+  };
+  await verifyAuthenticatedMember(page, memberRequest, productUrl);
+  page.evaluate = async () => ({
+    status: 200,
+    jsonObject: true,
+    errorsClear: true,
+    hasMember: true,
+    memberState: "null",
+  });
+  await assert.rejects(() => verifyAuthenticatedMember(page, memberRequest, productUrl), /not authenticated/);
+  await verifyAnonymousMember(page, productUrl);
+  page.evaluate = async () => ({
+    status: 200,
+    jsonObject: true,
+    errorsClear: true,
+    hasMember: false,
+    memberState: "missing",
+  });
+  await assert.rejects(() => verifyAnonymousMember(page, productUrl), /not provably anonymous/);
 });
 
 test("PDP quantity extraction ignores blank/action controls and reads one current value", () => {

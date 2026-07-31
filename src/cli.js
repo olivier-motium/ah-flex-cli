@@ -16,8 +16,10 @@ import {
 import {
   applyBasketInVisibleBrowser,
   buildApplyPlan,
+  closeVisibleAhBrowser,
   openLoginSession,
 } from "./browser.js";
+import { loadAhHarSession } from "./har-session.js";
 import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
 
@@ -33,13 +35,17 @@ Usage:
   ah-flex basket review <basket.json> --out <review.html> [--open]
   ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
-  ah-flex cart apply <basket.json> [--confirm-add] [--json]
+  ah-flex cart apply <basket.json> [--confirm-add (--guest | --har session.har)] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Browser writes use a
   visible dedicated profile, exact product URLs, and a post-write readback.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
-  session); --transport browser uses the visible browser profile instead.
+  session); --transport browser uses a fresh visible Firefox context instead.
+  --har imports only an allowlisted AH session subset into a nonpersistent
+  Firefox context and verifies the live member query before any cart click.
+  --guest prepares an unauthenticated browser cart and proves the live member is
+  null before any cart click; it never reads account/session cookies.
   Checkout, ordering, payment, substitutions, and implicit product selection do
   not exist. After verified readback, the visible browser is released to you.`;
 }
@@ -175,7 +181,7 @@ async function handleSession(args) {
     console.log("A dedicated visible AH Belgium browser is open and under your control. Complete login or verification there; ah-flex never reads the credentials.");
     await pauseVisibleBrowser("Leave the winkelmandje visible once login is complete.");
   } finally {
-    await context.close();
+    await closeVisibleAhBrowser(context);
   }
 }
 
@@ -184,10 +190,15 @@ async function handleCart(args) {
   const filePath = args.shift();
   if (action !== "apply" || !filePath) throw new BasketError("Use 'cart apply <basket.json>'");
   const confirmed = takeFlag(args, "--confirm-add");
+  const guest = takeFlag(args, "--guest");
+  const harPath = takeFlag(args, "--har", { value: true });
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   const basket = await loadBasket(path.resolve(filePath));
   if (!confirmed) {
+    if (harPath || guest) {
+      throw new BasketError("--guest and --har are only accepted with --confirm-add");
+    }
     const plan = buildApplyPlan(basket);
     if (asJson) console.log(JSON.stringify(plan, null, 2));
     else {
@@ -200,10 +211,20 @@ async function handleCart(args) {
   if (!input.isTTY) {
     throw new BasketError("--confirm-add requires an interactive terminal so the verified browser can be handed to you");
   }
+  if (guest === Boolean(harPath)) {
+    throw new BasketError("--confirm-add requires exactly one of --guest or --har <session.har>");
+  }
+  if (harPath && basket.items.length !== 1) {
+    throw new BasketError("HAR-backed confirmed apply currently supports exactly one exact product line");
+  }
+  const harSession = harPath ? await loadAhHarSession(path.resolve(harPath)) : null;
 
   let context = null;
   try {
-    const result = await applyBasketInVisibleBrowser(basket);
+    const result = await applyBasketInVisibleBrowser(basket, {
+      harSession,
+      sessionMode: guest ? "guest" : "har",
+    });
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {
@@ -233,7 +254,7 @@ async function handleCart(args) {
     }
     throw error;
   } finally {
-    if (context) await context.close();
+    if (context) await closeVisibleAhBrowser(context);
   }
 }
 
