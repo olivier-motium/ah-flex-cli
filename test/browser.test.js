@@ -9,6 +9,7 @@ import {
   findPdpPlusButton,
   isAllowedAutomationUrl,
   normalizeProductCandidate,
+  visibleBrowserLaunchOptions,
 } from "../src/browser.js";
 import { BasketError } from "../src/basket.js";
 
@@ -76,6 +77,12 @@ test("navigation guard allows only bounded AH Belgium pages and hard-blocks chec
   assert.equal(isAllowedAutomationUrl("https://www.ah.nl/mijnlijst"), false);
   assert.equal(isAllowedAutomationUrl("https://evil.example/zoeken"), false);
   assert.throws(() => assertAllowedAutomationUrl("https://www.ah.be/bestellen"), /Blocked browser navigation/);
+});
+
+test("visible browser keeps the Chromium OS sandbox enabled", () => {
+  const options = visibleBrowserLaunchOptions("/Applications/Google Chrome");
+  assert.equal(options.chromiumSandbox, true);
+  assert.equal(options.headless, false);
 });
 
 test("PDP quantity extraction ignores blank/action controls and reads one current value", () => {

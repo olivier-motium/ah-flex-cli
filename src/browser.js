@@ -299,12 +299,7 @@ export async function launchVisibleAhBrowser(options = {}) {
   const profileDir =
     options.profileDir ?? path.join(os.homedir(), "Library", "Application Support", "ah-flex-cli", "browser-profile");
   await mkdir(profileDir, { recursive: true, mode: 0o700 });
-  const context = await chromium.launchPersistentContext(profileDir, {
-    executablePath,
-    headless: false,
-    viewport: null,
-    acceptDownloads: false,
-  });
+  const context = await chromium.launchPersistentContext(profileDir, visibleBrowserLaunchOptions(executablePath));
 
   const navigationGuard = async (route) => {
     const request = route.request();
@@ -327,6 +322,16 @@ export async function releaseAutomationGuard(context) {
   if (!navigationGuard) return;
   await context.unroute("**/*", navigationGuard);
   navigationGuards.delete(context);
+}
+
+export function visibleBrowserLaunchOptions(executablePath) {
+  return {
+    executablePath,
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
+    chromiumSandbox: true,
+  };
 }
 
 async function activePage(context) {

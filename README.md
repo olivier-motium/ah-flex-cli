@@ -112,11 +112,16 @@ had denied both curl and the automated browser profile on `/zoeken`. The
 browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
 denying it, refresh the pinned Chrome version there.
 
-The cart write path is unchanged: visible browser, exact product pages,
-`--confirm-add` from an interactive terminal, and post-write readback. No real
-cart mutation has been attempted yet; that canary requires Olivier at the
-terminal. No command should be described as having prepared a real cart until
-that controlled canary succeeds.
+The cart write path uses a visible browser, exact product pages,
+`--confirm-add` from an interactive terminal, and post-write readback. The first
+controlled canary stopped on an Access Denied product page before any add
+control was reached, so no real cart mutation has yet been verified. No command
+should be described as having prepared a real cart until a controlled canary
+succeeds.
+
+The visible writer keeps Chromium's operating-system sandbox enabled. Besides
+being the safer browser boundary, this avoids AH denying product-page requests
+that arrive from a browser launched with Playwright's default `--no-sandbox`.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
