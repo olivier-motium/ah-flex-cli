@@ -1,0 +1,77 @@
+{
+  "$schema": "../schema/basket.schema.json",
+  "version": 1,
+  "region": "be",
+  "title": "Chicken, beef, and flexible healthy components",
+  "brief": "Next week we want some chicken and beef. Buy larger packs where the unit economics make sense, freeze portions, keep the fresh share realistic, and avoid assigning meals to weekdays.",
+  "items": [
+    {
+      "label": "Large lean chicken pack for portioning",
+      "query": "grote verpakking kipfilet",
+      "quantity": 2,
+      "storage": "freezer",
+      "uses": ["stir-fry component", "salad protein", "wrap filling"],
+      "note": "Compare price per kg, then freeze in meal-sized portions on arrival.",
+      "selected": null
+    },
+    {
+      "label": "Beef component with more than one use",
+      "query": "mager rundvlees familieverpakking",
+      "quantity": 2,
+      "storage": "freezer",
+      "uses": ["quick pan component", "tomato-based bowl", "taco-style filling"],
+      "note": "Choose mince, strips, or stew meat only after comparing unit price and fat content.",
+      "selected": null
+    },
+    {
+      "label": "Frozen mixed vegetables",
+      "query": "diepvries groentemix zonder saus",
+      "quantity": 2,
+      "storage": "freezer",
+      "uses": ["fast side", "stir-fry base", "soup backup"],
+      "selected": null
+    },
+    {
+      "label": "Long-lived fresh vegetables",
+      "query": "broccoli paprika wortel",
+      "quantity": 1,
+      "storage": "fresh",
+      "uses": ["raw snack or salad", "roasted side", "pan vegetables"],
+      "note": "Prefer vegetables that can survive several days without forcing a specific meal.",
+      "selected": null
+    },
+    {
+      "label": "Fresh flavour component",
+      "query": "verse kruiden citroen",
+      "quantity": 1,
+      "storage": "fresh",
+      "uses": ["simple dressing", "protein seasoning", "vegetable finish"],
+      "selected": null
+    },
+    {
+      "label": "Whole-grain base",
+      "query": "zilvervliesrijst grootverpakking",
+      "quantity": 1,
+      "storage": "pantry",
+      "uses": ["warm bowl", "cold lunch base", "backup side"],
+      "selected": null
+    },
+    {
+      "label": "Legume backup protein",
+      "query": "kikkererwten linzen blik multipack",
+      "quantity": 2,
+      "storage": "pantry",
+      "uses": ["meat-free bowl", "salad addition", "quick stew"],
+      "note": "Select a clearly priced total pack; ambiguous multipacks must be normalized manually.",
+      "selected": null
+    },
+    {
+      "label": "Tomato base",
+      "query": "passata zonder toegevoegde suiker",
+      "quantity": 3,
+      "storage": "pantry",
+      "uses": ["beef base", "bean base", "quick sauce"],
+      "selected": null
+    }
+  ]
+}

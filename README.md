@@ -6,8 +6,9 @@ Heijn Belgium basket without turning the week into a fixed meal plan.
 The core idea is **components, not menus**: the agent chooses a useful mix of
 pantry, freezer, and fresh ingredients that can be recombined in several ways.
 The CLI validates the basket, normalizes unit prices, refreshes visible product
-facts, renders a review sheet, and can prepare **Mijn lijst** through a visible
-browser session. It never places an order or touches payment.
+facts, renders a review sheet, and can prepare the **winkelmandje** at
+`/mijnlijst` through a visible browser session. It never places an order or
+touches payment.
 
 ## Boundaries
 
@@ -16,7 +17,12 @@ browser session. It never places an order or touches payment.
 - It never imports cookies, passwords, tokens, or session values from a HAR.
 - Login and verification stay inside a user-visible browser profile.
 - Cart/list changes are dry-run by default and require an explicit execution
-  flag. Checkout and payment automation do not exist.
+  flag. Checkout and payment automation do not exist. Once exact line/quantity
+  readback succeeds, browser control is released for the human handoff.
+- Preflight and readback use each exact product page's scoped basket controls;
+  the CLI does not infer cart state from recommendation cards. If a later line
+  fails after an earlier click, the CLI prints a partial receipt instead of
+  claiming that nothing changed.
 - Prices, promotions, availability, and substitutions remain provisional until
   the final browser review.
 
@@ -27,14 +33,30 @@ You:   "Next week: chicken and beef, healthy, flexible, buy bulk where useful."
 Agent: searches current AH products, compares pack/unit prices, and writes one
        small basket JSON file across pantry/freezer/fresh.
 CLI:   checks the basket, makes gaps and stale prices visible, renders review,
-       and—after explicit confirmation—adds the selected products to Mijn lijst.
+       and—after explicit confirmation—adds the selected products to the visible winkelmandje.
 You:   review the visible list and place the order yourself.
 ```
 
 No recipes, weekday slots, pantry database, inventory daemon, nutrition score,
 or auto-substitution engine are part of the product.
 
-## Planned command surface
+## Install
+
+Requires Node.js 20+ and a local Chrome, Chromium, or Edge installation.
+
+```sh
+npm install
+npm link
+ah-flex --help
+```
+
+`ah-flex` stores its dedicated visible-browser profile under
+`~/Library/Application Support/ah-flex-cli/browser-profile` on macOS. Login
+cookies stay inside that browser-managed profile; the CLI does not inspect or
+export them. Set `AH_FLEX_BROWSER` only when the browser executable is in a
+non-standard location.
+
+## Command surface
 
 ```text
 ah-flex template --brief "chicken and beef next week"
@@ -46,9 +68,45 @@ ah-flex cart apply basket.json                 # dry-run
 ah-flex cart apply basket.json --confirm-add   # visible browser writes only
 ```
 
-The browser adapter targets `https://www.ah.be/` only and fails closed when the
-site's accessible controls no longer match. It leaves the final list visible;
-the user remains the only person who can continue to ordering or payment.
+During automation, the browser adapter targets bounded pages on
+`https://www.ah.be/` only and fails closed when the site's accessible controls
+no longer match. After verified readback it removes that automation guard and
+leaves the final winkelmandje visible; the user remains the only person who can
+continue to login, ordering, or payment.
+
+## Agent workflow
+
+1. Start from `ah-flex template --brief "..."` or
+   [`examples/chicken-beef.json`](examples/chicken-beef.json).
+2. Let the agent run `ah-flex search "..." --json` for each component and
+   compare price per kg, litre, or piece. Search returns candidates; it never
+   silently selects the first result.
+3. The agent writes the chosen exact AH Belgium URL and current product facts
+   into each `selected` field.
+4. Run `basket check`, generate the static review, then run `cart apply` without
+   the execution flag. Unresolved, unavailable, or stale lines block apply.
+5. After reviewing the exact dry-run, `--confirm-add` opens the dedicated
+   browser, changes the winkelmandje, rereads every exact URL and quantity, and
+   hands the visible browser to the user. This confirmed command requires an
+   interactive terminal so that handoff cannot disappear into a background job.
+
+The checked-in chicken-and-beef example is intentionally unresolved: it is the
+recombinable component brief, not fake or stale product data.
+
+## Current live boundary
+
+The data model, report, dry-run, URL guards, visible-card fact normalization,
+and write/readback orchestration have local test coverage. The first live AH
+Belgium UI canary has not yet completed end to end. A read-only search canary
+exposed the current long-form unit wording and then AH's bot protection denied
+the browser profile; the parser was corrected, but the blocked rerun could not
+confirm it. The CLI reports that denial and does not retry automatically. No
+command should be described as having prepared a real cart until a controlled
+canary succeeds.
+
+The write target is the AH page at `/mijnlijst`, which AH labels
+**Winkelmandje**. Turning that reviewed cart into an order remains a human
+action.
 
 ## Why the HAR is not a runtime dependency
 
@@ -57,3 +115,6 @@ browser sessions and exposed read-only GraphQL operations, but it contained no
 cart mutation. It is credential-bearing evidence, not configuration. No HAR
 contents are copied into this repository.
 
+The implementation is custom. Public grocery MCPs informed the generic safety
+shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or
+MCP code is copied or linked into the runtime.
