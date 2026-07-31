@@ -17,8 +17,8 @@ import {
   applyBasketInVisibleBrowser,
   buildApplyPlan,
   openLoginSession,
-  searchProducts,
 } from "./browser.js";
+import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -31,13 +31,15 @@ Usage:
   ah-flex schema
   ah-flex basket check <basket.json> [--json]
   ah-flex basket review <basket.json> --out <review.html> [--open]
-  ah-flex search <query> [--limit 8] [--json]
+  ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
   ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Browser writes use a
   visible dedicated profile, exact product URLs, and a post-write readback.
+  Search reads mimic a real browser over plain HTTPS (no cookies, no stored
+  session); --transport browser uses the visible browser profile instead.
   Checkout, ordering, payment, substitutions, and implicit product selection do
   not exist. After verified readback, the visible browser is released to you.`;
 }
@@ -141,13 +143,17 @@ async function handleSearch(args) {
   const query = args.shift();
   if (!query) throw new BasketError("search requires a query");
   const limitRaw = takeFlag(args, "--limit", { value: true, defaultValue: "8" });
+  const transport = takeFlag(args, "--transport", { value: true, defaultValue: "http" });
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   const limit = Number(limitRaw);
   if (!Number.isInteger(limit) || limit < 1 || limit > 25) {
     throw new BasketError("--limit must be an integer from 1 to 25");
   }
-  const products = await searchProducts(query, { limit });
+  if (!TRANSPORTS.includes(transport)) {
+    throw new BasketError(`--transport must be one of: ${TRANSPORTS.join(", ")}`);
+  }
+  const products = await searchProducts(query, { limit, transport });
   if (asJson) {
     console.log(JSON.stringify(products, null, 2));
     return;

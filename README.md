@@ -14,6 +14,11 @@ touches payment.
 
 - This is a custom personal-use browser helper, not an official AH integration.
 - It does not call or clone AH's undocumented GraphQL or mobile APIs.
+- Search reads fetch the same public `www.ah.be` pages a browser loads, over
+  plain HTTPS with the browser's request headers (AH-authorized browser
+  mimicry; the edge otherwise answers Access Denied on `/zoeken`). Product
+  facts come from the structured payload embedded in those pages, not from
+  screen scraping. No cookies or session values are sent or stored for reads.
 - It never imports cookies, passwords, tokens, or session values from a HAR.
 - Login and verification stay inside a user-visible browser profile.
 - Cart/list changes are dry-run by default and require an explicit execution
@@ -62,11 +67,15 @@ non-standard location.
 ah-flex template --brief "chicken and beef next week"
 ah-flex basket check basket.json [--json]
 ah-flex basket review basket.json --out review.html [--open]
-ah-flex search "kipfilet" --limit 8 [--json]
+ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
 ah-flex session login
 ah-flex cart apply basket.json                 # dry-run
 ah-flex cart apply basket.json --confirm-add   # visible browser writes only
 ```
+
+`search` defaults to the HTTP transport, which needs no login and no browser.
+`--transport browser` keeps the original visible-browser read as a diagnostic
+fallback. Neither transport retries automatically after an Access Denied.
 
 During automation, the browser adapter targets bounded pages on
 `https://www.ah.be/` only and fails closed when the site's accessible controls
@@ -95,14 +104,19 @@ recombinable component brief, not fake or stale product data.
 
 ## Current live boundary
 
-The data model, report, dry-run, URL guards, visible-card fact normalization,
-and write/readback orchestration have local test coverage. The first live AH
-Belgium UI canary has not yet completed end to end. A read-only search canary
-exposed the current long-form unit wording and then AH's bot protection denied
-the browser profile; the parser was corrected, but the blocked rerun could not
-confirm it. The CLI reports that denial and does not retry automatically. No
-command should be described as having prepared a real cart until a controlled
-canary succeeds.
+The data model, report, dry-run, URL guards, fact normalization, and
+write/readback orchestration have local test coverage. The live read canary
+passed on 2026-07-31: `search` over the HTTP transport returned exact product
+URLs, prices, packs, and unit prices from `www.ah.be` after the Akamai edge
+had denied both curl and the automated browser profile on `/zoeken`. The
+browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
+denying it, refresh the pinned Chrome version there.
+
+The cart write path is unchanged: visible browser, exact product pages,
+`--confirm-add` from an interactive terminal, and post-write readback. No real
+cart mutation has been attempted yet; that canary requires Olivier at the
+terminal. No command should be described as having prepared a real cart until
+that controlled canary succeeds.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
