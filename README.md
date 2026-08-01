@@ -18,18 +18,24 @@ touches payment.
   same-origin requests inside the authenticated page; this is personal browser
   automation, not a public or official API. A separate pinned `member` query
   proves the trusted profile holds an authenticated account before any write.
-- Search reads fetch the same public `www.ah.be` pages a browser loads, over
-  plain HTTPS with the browser's request headers (AH-authorized browser
-  mimicry; the edge otherwise answers Access Denied on `/zoeken`). Product
-  facts come from the structured payload embedded in those pages, not from
-  screen scraping. No cookies or session values are sent or stored for reads.
-- Browser writes use one dedicated persistent Firefox profile owned by the CLI
-  (default `~/.ah-flex/firefox-profile`, override with `AH_FLEX_PROFILE_DIR`,
-  created `0700`). The CLI reuses that same profile for every run. Authenticate
-  it either through the visible one-time `session login` flow or with the
-  explicit macOS-only `session import-firefox` command below.
-- Password entry, verification codes, and the privacy choice stay outside the
-  CLI. The optional importer transfers only rows scoped to `ah.be` and its
+- Default search reads fetch public `www.ah.be` pages over plain HTTPS with a
+  pinned browser header set; the edge otherwise answers Access Denied on
+  `/zoeken`. Product facts come from the structured payload embedded in those
+  pages, not from screen scraping. This default transport sends no cookies or
+  stored session values. The optional browser diagnostic transport uses the
+  dedicated persistent profile described below.
+- Browser writes use one fixed dedicated persistent Firefox profile owned by the
+  CLI at `~/.ah-flex/firefox-profile`; the CLI exposes no profile-directory
+  override. Before Firefox launches, the final path component must be a
+  current-user-owned directory with exactly private mode `0700`; a missing
+  target is created once with `0700` and its effective mode is verified.
+  Existing symlinks, non-directories, wrong-owner targets, and broader modes
+  are rejected without chmodding them. The CLI reuses that same profile for
+  every run. Authenticate it either through the visible one-time `session
+  login` flow or with the explicit macOS-only `session import-firefox` command
+  below.
+- Password entry and verification codes stay outside the CLI. The optional
+  importer transfers only rows scoped to `ah.be` and its
   subdomains between two closed local Firefox cookie databases. Cookie names
   and values remain opaque SQLite data: they are never printed, exported to an
   intermediary file, included in receipts, tests, or Git, or accepted on the
@@ -105,8 +111,8 @@ fallback. Neither transport retries automatically after an Access Denied.
 
 `session login` opens the dedicated profile on ah.be and waits until the pinned
 member query proves the account session is active, then closes the browser.
-`session status` probes the saved profile without changing anything and exits
-non-zero unless the session is authenticated.
+`session status` additionally proves that `/mijnlijst` is usable and not denied;
+it exits non-zero unless both checks make the session ready for cart apply.
 
 On macOS, `session import-firefox` can reuse an AH login from another local
 Firefox profile without ever automating that everyday profile. Quit Firefox
@@ -115,10 +121,12 @@ source profile directory and the exact `--confirm-ah-cookie-copy` flag. The
 command uses the system `lsof` and `sqlite3`, requires compatible Firefox cookie
 schemas, copies the schema's ordinary non-ID cookie columns, replaces only
 `ah.be`/`*.ah.be` rows in one transaction, and prints a
-non-sensitive row-count receipt. Run `session status` immediately afterwards;
-the live member query, not the copy receipt, decides whether authentication
-works. The command fails closed instead of copying a whole profile or migrating
-between incompatible Firefox schemas.
+non-sensitive row-count receipt. On a first-time cookie import, initialize the
+dedicated profile once with `session status` or `session login` before running
+the importer. Run `session status` immediately afterwards; the live member
+query and usable `/mijnlijst` page, not the copy receipt, decide whether
+authentication works. The command fails closed instead of copying a whole
+profile or migrating between incompatible Firefox schemas.
 
 During automation, the browser adapter targets bounded pages on
 `https://www.ah.be/` only and fails closed when the site's accessible controls
@@ -176,11 +184,10 @@ The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
 action.
 
-The authenticated write/readback canary passed on 2026-08-01 with the full
-26-line healthier basket: the CLI found 28 existing packs, topped the reviewed
-Spa line from one to four through three acknowledged browser-issued writes, and
-then proved all 26 exact URLs and all 31 requested packs in one fresh list-page
-readback. No checkout or ordering page was opened.
+The authenticated write/readback canary passed on 2026-08-01: 10 missing exact
+lines were added in one batch, 26 existing exact lines were preserved, and
+36 products / 42 packs were verified by fresh GraphQL and reloaded DOM
+readbacks. No checkout or ordering page was opened.
 
 ## Session boundary
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,12 +34,12 @@ async function profiles(t, sourceSql, destinationSql, sourceSchema = baseSchema)
   t.after(() => rm(root, { recursive: true, force: true }));
   const sourceDir = path.join(root, "source");
   const destinationDir = path.join(root, "destination");
-  await Promise.all([mkdir(sourceDir), mkdir(destinationDir)]);
+  await Promise.all([mkdir(sourceDir), mkdir(destinationDir, { mode: 0o700 })]);
   const sourceDatabase = path.join(sourceDir, "cookies.sqlite");
   const destinationDatabase = path.join(destinationDir, "cookies.sqlite");
   runSqlite(sourceDatabase, `${sourceSchema}\n${sourceSql}`);
   runSqlite(destinationDatabase, `${baseSchema}\n${destinationSql}`);
-  return { sourceDir, destinationDir, sourceDatabase, destinationDatabase };
+  return { root, sourceDir, destinationDir, sourceDatabase, destinationDatabase };
 }
 
 test("scoped import replaces only AH-domain rows and reports only a count and paths", async (t) => {
@@ -114,9 +114,25 @@ test("active, dangerous, and identical profiles fail before mutation", async (t)
     () => importFirefoxAhCookies(fixture.destinationDir, { profileDir: fixture.destinationDir }),
     /must be different/i,
   );
+
+  await chmod(fixture.destinationDir, 0o755);
+  await assert.rejects(
+    () => importFirefoxAhCookies(fixture.sourceDir, { profileDir: fixture.destinationDir }),
+    /private mode 0700/i,
+  );
+  assert.equal(runSqlite(fixture.destinationDatabase, "SELECT name FROM moz_cookies;"), "destination-ah");
+  await chmod(fixture.destinationDir, 0o700);
+
+  const destinationLink = path.join(fixture.root, "destination-link");
+  await symlink(fixture.destinationDir, destinationLink);
+  await assert.rejects(
+    () => importFirefoxAhCookies(fixture.sourceDir, { profileDir: destinationLink }),
+    /final-component symlink/i,
+  );
+  assert.equal(runSqlite(fixture.destinationDatabase, "SELECT name FROM moz_cookies;"), "destination-ah");
 });
 
-test("CLI requires the exact cookie-copy confirmation flag", () => {
+test("CLI rejects unsafe or unsupported session flags before doing work", () => {
   const result = spawnSync(process.execPath, [cliPath, "session", "import-firefox", "/tmp/source", "--json"], {
     cwd: repoRoot,
     encoding: "utf8",
@@ -124,4 +140,12 @@ test("CLI requires the exact cookie-copy confirmation flag", () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /requires the exact --confirm-ah-cookie-copy flag/i);
   assert.equal(result.stdout, "");
+
+  const loginJson = spawnSync(process.execPath, [cliPath, "session", "login", "--json"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  assert.equal(loginJson.status, 1);
+  assert.match(loginJson.stderr, /session login does not support --json/i);
+  assert.equal(loginJson.stdout, "");
 });

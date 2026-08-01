@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { BasketError } from "./basket.js";
-import { resolveProfileDir } from "./browser.js";
+import { ensureProfileDir } from "./browser.js";
 
 const SQLITE3 = "/usr/bin/sqlite3";
 const LSOF = "/usr/sbin/lsof";
@@ -200,7 +200,6 @@ export function buildAhCookieImportSql(columnNames, sourceDatabaseUri) {
     `SELECT ${columns} FROM "ah_source"."moz_cookies" WHERE ${predicate};`,
     "SELECT changes();",
     "COMMIT;",
-    "DETACH DATABASE \"ah_source\";",
   ].join("\n");
 }
 
@@ -210,7 +209,7 @@ export async function importFirefoxAhCookies(sourceProfileDir, options = {}) {
   }
   const runTool = options.runTool ?? runLocalTool;
   const isOpen = options.isOpen ?? ((databasePath) => databaseIsOpen(databasePath, runTool));
-  const destinationCandidate = resolveProfileDir({ profileDir: options.profileDir });
+  const destinationCandidate = await ensureProfileDir({ profileDir: options.profileDir });
   const [source, destination] = await Promise.all([
     existingProfile(sourceProfileDir, "Source", false),
     existingProfile(destinationCandidate, "Destination", true),

@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { chmod, mkdir } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { firefox } from "playwright-core";
 import { assertActionableBasket, assertExactProductUrl, BasketError, calculateUnitPrice } from "./basket.js";
 import {
@@ -20,27 +20,6 @@ import {
 } from "./basket-graphql.js";
 import { createMemberRequestBody } from "./member-query.js";
 
-export {
-  BASKET_COLLECTIONS,
-  BASKET_ITEMS_ADD_MUTATION,
-  BASKET_ITEMS_ADD_OPERATION,
-  BASKET_ITEMS_UPDATE_MUTATION,
-  BASKET_ITEMS_UPDATE_OPERATION,
-  BASKET_QUERY,
-  BASKET_QUERY_OPERATION,
-  basketCollectionItems,
-  buildBasketMutationPlan,
-  createBasketItemsAddRequest,
-  createBasketItemsUpdateRequest,
-  createBasketQueryRequest,
-  normalizeBasketCollections,
-  normalizeBasketGraphqlResponse,
-  normalizeRequestedLines,
-  parseProductIdFromUrl,
-  reconcileTopUpCandidates,
-  validateBasketMutationResponse,
-} from "./basket-graphql.js";
-
 const AH_ORIGIN = "https://www.ah.be";
 const BLOCKED_PATH = /\/(?:checkout|afrekenen|bestellen|betaling|payment|order)(?:\/|$)/i;
 const ALLOWED_PATH = /^(?:\/$|\/zoeken(?:\/|$)|\/producten\/product\/|\/mijnlijst(?:\/|$)|\/mijn(?:\/|$)|\/inloggen(?:\/|$))/;
@@ -48,13 +27,14 @@ const DEFAULT_PROFILE_DIR = path.join(".ah-flex", "firefox-profile");
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_POLL_MS = 2_000;
 const BASKET_GRAPHQL_TIMEOUT_MS = 15_000;
+const MEMBER_GRAPHQL_TIMEOUT_MS = 15_000;
 const BASKET_GRAPHQL_MAX_BYTES = 512 * 1024;
+const PRIVATE_PROFILE_MODE = 0o700;
 
 const navigationGuards = new WeakMap();
 
 export function resolveProfileDir(options = {}) {
-  const candidate =
-    options.profileDir ?? process.env.AH_FLEX_PROFILE_DIR ?? path.join(os.homedir(), DEFAULT_PROFILE_DIR);
+  const candidate = options.profileDir ?? path.join(os.homedir(), DEFAULT_PROFILE_DIR);
   if (typeof candidate !== "string" || !candidate.trim()) {
     throw new BasketError("The AH browser profile directory must be a non-empty path");
   }
@@ -65,10 +45,34 @@ export function resolveProfileDir(options = {}) {
   return resolved;
 }
 
-async function ensureProfileDir(options = {}) {
+function assertProfileTarget(profileStat, dir) {
+  if (profileStat.isSymbolicLink()) {
+    throw new BasketError(`Refusing to use final-component symlink '${dir}' as the AH browser profile directory`);
+  }
+  if (!profileStat.isDirectory()) {
+    throw new BasketError(`The AH browser profile path is not a directory: ${dir}`);
+  }
+  if (typeof process.getuid === "function" && profileStat.uid !== process.getuid()) {
+    throw new BasketError(`The AH browser profile directory is not owned by the current user: ${dir}`);
+  }
+  if ((profileStat.mode & 0o7777) !== PRIVATE_PROFILE_MODE) {
+    throw new BasketError(`The existing AH browser profile directory must already have private mode 0700: ${dir}`);
+  }
+}
+
+export async function ensureProfileDir(options = {}) {
   const dir = resolveProfileDir(options);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  await chmod(dir, 0o700).catch(() => {});
+  let existing = null;
+  try {
+    existing = await lstat(dir);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (existing) assertProfileTarget(existing, dir);
+  else await mkdir(dir, { recursive: true, mode: PRIVATE_PROFILE_MODE });
+
+  const effective = await lstat(dir);
+  assertProfileTarget(effective, dir);
   return dir;
 }
 
@@ -219,16 +223,18 @@ async function readProductCardsFromPage(page) {
 
 export function buildApplyPlan(basket, options = {}) {
   assertActionableBasket(basket, options);
+  const lines = basket.items.map((item) => ({
+    label: item.label,
+    url: assertExactProductUrl(item.selected.url),
+    quantity: item.quantity,
+    expected_name: item.selected.name,
+    expected_price_eur: item.selected.price_eur,
+  }));
+  normalizeRequestedLines(lines);
   return {
     target: `${AH_ORIGIN}/mijnlijst`,
     mode: "dry-run",
-    lines: basket.items.map((item) => ({
-      label: item.label,
-      url: assertExactProductUrl(item.selected.url),
-      quantity: item.quantity,
-      expected_name: item.selected.name,
-      expected_price_eur: item.selected.price_eur,
-    })),
+    lines,
     warning: "No browser was opened and nothing was changed. Use --confirm-add for visible Mijn lijst changes.",
   };
 }
@@ -254,7 +260,7 @@ function readbackMismatches(lines, expectedFinal, rows, label) {
   const observedRows = indexSnapshot(rows);
   const mismatches = [];
   for (const line of lines) {
-    const expected = expectedFinal.get(line.url) ?? line.quantity;
+    const expected = expectedFinal.get(line.url);
     const observed = observedRows.get(line.url);
     if (!observed) {
       mismatches.push(`${line.url}: exact product missing from ${label}`);
@@ -265,9 +271,34 @@ function readbackMismatches(lines, expectedFinal, rows, label) {
   return mismatches;
 }
 
+function rebuildDispatchedAction(action, observed) {
+  action.action = "attempted";
+  delete action.observed_quantity;
+  if (!observed) return;
+
+  action.observed_quantity = observed.quantity;
+  if (observed.quantity === action.quantity) {
+    action.action = Object.prototype.hasOwnProperty.call(action, "from_quantity") ? "topped-up" : "added";
+  } else if (observed.quantity > action.quantity) {
+    action.action = "kept-higher";
+  }
+}
+
+function rebuildUndispatchedAction(action, observed) {
+  action.action = "not-attempted";
+  delete action.observed_quantity;
+  if (!observed) return;
+
+  action.observed_quantity = observed.quantity;
+  if (observed.quantity === action.quantity) {
+    action.action = "already-present";
+  } else if (observed.quantity > action.quantity) {
+    action.action = "kept-higher";
+  }
+}
+
 export async function applyBasketWithAdapter(basket, adapter, options = {}) {
   const plan = buildApplyPlan(basket, options);
-  const requested = normalizeRequestedLines(plan.lines);
   if (!adapter || typeof adapter.read !== "function" || typeof adapter.applyExactBatch !== "function") {
     throw new TypeError("Adapter must provide read() and applyExactBatch() methods");
   }
@@ -275,7 +306,6 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
   let beforeRows = [];
   let afterRows = [];
   let before = new Map();
-  const requestedById = new Map(requested.map((line) => [line.id, line]));
   const dispatchedIds = new Set();
   const actions = [];
   try {
@@ -324,7 +354,7 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
         const ids = items.map((item) =>
           Number.isSafeInteger(item?.id) ? item.id : parseProductIdFromUrl(item?.url),
         );
-        if (ids.some((id) => !changeIds.has(id) || !requestedById.has(id))) {
+        if (ids.some((id) => !changeIds.has(id))) {
           throw new BasketError("Basket adapter reported an unreviewed mutation; no request was dispatched");
         }
         for (const id of ids) dispatchedIds.add(id);
@@ -376,6 +406,7 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
     }
 
     return {
+      complete: true,
       target: plan.target,
       actions,
       before: [...before.values()],
@@ -387,33 +418,31 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
     const error =
       cause instanceof BasketError ? cause : new BasketError(cause instanceof Error ? cause.message : String(cause));
     if (dispatchedIds.size) {
+      let safeAfterRows = [];
+      let safeObserved = null;
       try {
-        afterRows = await adapter.read();
+        const candidateRows = await adapter.read();
+        const candidateObserved = indexSnapshot(candidateRows);
+        afterRows = candidateRows;
+        safeAfterRows = candidateRows;
+        safeObserved = candidateObserved;
       } catch {
-        // A mutation was dispatched, but a safe readback is unavailable. Keep every attempted line uncertain.
+        // Preserve the original failure if a conservative readback is unavailable or malformed.
       }
-      const observed = indexSnapshot(afterRows);
       for (const action of actions) {
-        if (action.action !== "pending") continue;
         const id = parseProductIdFromUrl(action.url);
-        if (!dispatchedIds.has(id)) {
-          action.action = "not-attempted";
+        if (dispatchedIds.has(id)) {
+          rebuildDispatchedAction(action, safeObserved?.get(action.url));
           continue;
         }
-        action.action = "attempted";
-        const row = observed.get(action.url);
-        if (row?.quantity === action.quantity) {
-          action.action = Object.prototype.hasOwnProperty.call(action, "from_quantity") ? "topped-up" : "added";
-        } else if (row && row.quantity > action.quantity) {
-          action.action = "kept-higher";
-          action.observed_quantity = row.quantity;
-        }
+        if (safeObserved) rebuildUndispatchedAction(action, safeObserved.get(action.url));
+        else if (action.action === "pending") action.action = "not-attempted";
       }
       error.partialReceipt = {
         complete: false,
         target: plan.target,
         actions,
-        observed: afterRows,
+        observed: safeAfterRows,
       };
       error.diagnostics = [
         ...(error.diagnostics ?? []),
@@ -468,6 +497,21 @@ export async function releaseAutomationGuard(context) {
   navigationGuards.delete(context);
 }
 
+export function attachVerifiedReceipt(error, receipt) {
+  if (!error || typeof error !== "object") throw new TypeError("A handoff error is required");
+  error.verifiedReceipt = receipt;
+  error.diagnostics = [
+    ...(error.diagnostics ?? []),
+    {
+      level: "error",
+      code: "VERIFIED_CART_HANDOFF_FAILED",
+      path: "browser",
+      message: "The cart readbacks were verified, but browser handoff cleanup failed",
+    },
+  ];
+  return error;
+}
+
 export function visibleFirefoxLaunchOptions() {
   return {
     channel: "moz-firefox",
@@ -501,35 +545,45 @@ export function createMemberRequest() {
 async function probeMemberState(page, memberRequest) {
   let result;
   try {
-    result = await page.evaluate(async ({ headers, body }) => {
-      const response = await fetch("/gql", {
-        method: "POST",
-        credentials: "include",
-        headers,
-        body: JSON.stringify(body),
-      });
-      let json = null;
-      try {
-        json = await response.json();
-      } catch {
-        // Non-JSON responses cannot prove authentication.
-      }
-      const jsonObject = Boolean(json && typeof json === "object" && !Array.isArray(json));
-      const hasErrors = jsonObject && Object.prototype.hasOwnProperty.call(json, "errors");
-      const errorsClear = !hasErrors || (Array.isArray(json.errors) && json.errors.length === 0);
-      const dataObject = Boolean(jsonObject && json.data && typeof json.data === "object" && !Array.isArray(json.data));
-      const hasMember = dataObject && Object.prototype.hasOwnProperty.call(json.data, "member");
-      const member = hasMember ? json.data.member : undefined;
-      const memberState =
-        member === null
-          ? "null"
-          : member && typeof member === "object" && !Array.isArray(member)
-            ? "object"
-            : hasMember
-              ? "other"
-              : "missing";
-      return { status: response.status, jsonObject, errorsClear, hasMember, memberState };
-    }, memberRequest);
+    result = await page.evaluate(
+      async ({ headers, body, timeoutMs }) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch("/gql", {
+            method: "POST",
+            credentials: "include",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+          let json = null;
+          try {
+            json = await response.json();
+          } catch {
+            // Non-JSON responses cannot prove authentication.
+          }
+          const jsonObject = Boolean(json && typeof json === "object" && !Array.isArray(json));
+          const hasErrors = jsonObject && Object.prototype.hasOwnProperty.call(json, "errors");
+          const errorsClear = !hasErrors || (Array.isArray(json.errors) && json.errors.length === 0);
+          const dataObject = Boolean(jsonObject && json.data && typeof json.data === "object" && !Array.isArray(json.data));
+          const hasMember = dataObject && Object.prototype.hasOwnProperty.call(json.data, "member");
+          const member = hasMember ? json.data.member : undefined;
+          const memberState =
+            member === null
+              ? "null"
+              : member && typeof member === "object" && !Array.isArray(member)
+                ? "object"
+                : hasMember
+                  ? "other"
+                  : "missing";
+          return { status: response.status, jsonObject, errorsClear, hasMember, memberState };
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+      { ...memberRequest, timeoutMs: MEMBER_GRAPHQL_TIMEOUT_MS },
+    );
   } catch {
     throw new BasketError("The live AH member state could not be verified; no cart action was attempted");
   }
@@ -549,6 +603,9 @@ export function interpretMemberProbe(result) {
 
 export async function verifyAuthenticatedMember(page, memberRequest, targetUrl) {
   await safeGoto(page, assertAllowedAutomationUrl(targetUrl));
+  if (new URL(page.url()).pathname !== "/mijnlijst" || (await readAccessDenied(page))) {
+    throw new BasketError("The AH Mijn lijst page is unavailable or denied; no cart action was attempted");
+  }
   const result = await probeMemberState(page, memberRequest);
   if (!interpretMemberProbe(result)) {
     throw new BasketError(
@@ -639,9 +696,8 @@ async function updateBasketItemsGql(page, items, onDispatch) {
 }
 
 function snapshotRows(snapshot, lines) {
-  const requested = normalizeRequestedLines(lines);
   const observed = new Map(basketCollectionItems(snapshot).map((item) => [item.id, item.quantity]));
-  return requested
+  return lines
     .filter((line) => observed.has(line.id))
     .map((line) => ({ url: line.url, name: line.expected_name, quantity: observed.get(line.id) }));
 }
@@ -696,11 +752,23 @@ export function createBasketGraphqlAdapter(page, lines) {
       const reconciled = reconcileTopUpCandidates({ ...initialPlan, lines: outcomes }, snapshot);
       outcomes = reconciled.lines;
       if (reconciled.updateItems.length) {
-        await updateBasketItemsGql(page, reconciled.updateItems, onDispatch);
-        const updatedIds = new Set(reconciled.updateItems.map((item) => item.id));
-        outcomes = outcomes.map((line) =>
-          updatedIds.has(line.id) ? { ...line, action: "topped-up", observed_quantity: line.quantity } : line,
+        const updateAcknowledgement = await updateBasketItemsGql(page, reconciled.updateItems, onDispatch);
+        const updatedSnapshot = new Map(
+          basketCollectionItems(updateAcknowledgement.snapshot).map((item) => [item.id, item.quantity]),
         );
+        const updatedIds = new Set(reconciled.updateItems.map((item) => item.id));
+        outcomes = outcomes.map((line) => {
+          if (!updatedIds.has(line.id)) return line;
+          const observed = updatedSnapshot.get(line.id);
+          if (!Number.isInteger(observed) || observed < line.quantity) {
+            throw new BasketError("AH did not expose every updated exact item in the acknowledged basket snapshot");
+          }
+          return {
+            ...line,
+            action: observed === line.quantity ? "topped-up" : "kept-higher",
+            observed_quantity: observed,
+          };
+        });
       }
       return { outcomes };
     },
@@ -887,7 +955,7 @@ const LOGIN_LANDING_HTML = `<!doctype html>
 <body style="font-family:system-ui,-apple-system,sans-serif;background:#00a0e4;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
 <div style="max-width:660px;text-align:center;padding:24px">
 <h1 style="font-size:34px;margin:0 0 16px">This is the ah-flex window</h1>
-<p style="font-size:20px;line-height:1.5">Your everyday Firefox login does <b>not</b> count here. This fresh, empty profile needs its own one-time AH account login.</p>
+<p style="font-size:20px;line-height:1.5">Your everyday Firefox login does <b>not</b> count here. This dedicated profile needs its own active AH account session.</p>
 <p style="margin:32px 0"><a href="https://www.ah.be/inloggen" style="display:inline-block;background:#fff;color:#00a0e4;font-size:24px;padding:16px 36px;border-radius:10px;text-decoration:none;font-weight:700">Open ah.be login &rarr;</a></p>
 <p style="font-size:16px;line-height:1.5;background:rgba(0,0,0,.18);border-radius:10px;padding:14px 18px">If AH emails you a login link or code: <b>copy the link and paste it into THIS window's address bar</b> (or type the code here). Clicking the link in your mail opens your everyday browser and the login lands there instead.</p>
 <p style="font-size:14px;opacity:.85">ah-flex watches until the account session is active, then closes this window. It never sees your credentials.</p>
@@ -953,20 +1021,46 @@ export async function sessionStatus(options = {}) {
     } catch {
       probeError = true;
     }
-    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`).catch(() => {});
-    const listDenied = await readAccessDenied(page);
-    const state = homeDenied
+    let listNavigationError = false;
+    try {
+      await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
+    } catch {
+      listNavigationError = true;
+    }
+    const listDenied = listNavigationError ? null : await readAccessDenied(page);
+    let listUrl = null;
+    try {
+      const url = new URL(page.url());
+      listUrl = url.toString();
+    } catch {
+      // The page URL remains unusable for the status receipt.
+    }
+    const listUsable =
+      !listNavigationError &&
+      !listDenied &&
+      (() => {
+        try {
+          const url = new URL(page.url());
+          return url.origin === AH_ORIGIN && url.pathname === "/mijnlijst";
+        } catch {
+          return false;
+        }
+      })();
+    const memberAuthenticated = !probeError && interpretMemberProbe(probe);
+    const state = homeDenied || listDenied
       ? "denied"
       : probeError
         ? "unknown"
-        : interpretMemberProbe(probe)
-          ? "authenticated"
-          : "anonymous";
+        : !memberAuthenticated
+          ? "anonymous"
+          : listUsable
+            ? "authenticated"
+            : "unknown";
     return {
       state,
       home: { url: `${AH_ORIGIN}/`, accessDenied: homeDenied },
       memberProbe: probe,
-      mijnlijst: { url: page.url(), accessDenied: listDenied },
+      mijnlijst: { url: listUrl ?? page.url(), accessDenied: listDenied, usable: listUsable },
     };
   } finally {
     await context.close();
@@ -976,23 +1070,28 @@ export async function sessionStatus(options = {}) {
 export async function applyBasketInVisibleBrowser(basket, options = {}) {
   const plan = buildApplyPlan(basket, options);
   const context = await launchAhProfileContext(options);
-  const page = await activePage(context);
-  const adapter = createBasketGraphqlAdapter(page, plan.lines);
+  let page = null;
+  let verifiedReceipt = null;
   try {
+    page = await activePage(context);
+    const adapter = createBasketGraphqlAdapter(page, plan.lines);
     await verifyAuthenticatedMember(page, createMemberRequest(), plan.target);
     const privacy = await ensureNecessaryCookiePreference(page);
     const receipt = await applyBasketWithAdapter(basket, adapter, options);
     if (privacy.changed) {
       receipt.warnings.unshift("AH privacy prompt declined optional cookies; necessary cookies only.");
     }
+    verifiedReceipt = receipt;
     if (new URL(page.url()).pathname !== "/mijnlijst") {
       await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
     }
     await releaseAutomationGuard(context);
     return { context, page, receipt };
-  } catch (error) {
+  } catch (cause) {
+    const error = cause instanceof Error ? cause : new BasketError(String(cause));
+    if (verifiedReceipt && !error.verifiedReceipt) attachVerifiedReceipt(error, verifiedReceipt);
     error.browserContext = context;
-    error.browserPage = page;
+    if (page) error.browserPage = page;
     throw error;
   }
 }

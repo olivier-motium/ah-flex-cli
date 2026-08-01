@@ -1,12 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { chmod, lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   applyBasketWithAdapter,
+  attachVerifiedReceipt,
   assertAllowedAutomationUrl,
   assertCookiePopupAbsent,
-  BASKET_ITEMS_ADD_OPERATION,
   buildApplyPlan,
   ensureNecessaryCookiePreference,
+  ensureProfileDir,
   interpretMemberProbe,
   isAllowedAutomationUrl,
   normalizeProductCandidate,
@@ -16,6 +20,7 @@ import {
   visibleFirefoxLaunchOptions,
 } from "../src/browser.js";
 import { BasketError } from "../src/basket.js";
+import { BASKET_ITEMS_ADD_OPERATION, BASKET_ITEMS_UPDATE_OPERATION } from "../src/basket-graphql.js";
 
 function actionableBasket() {
   const checkedAt = new Date().toISOString();
@@ -128,23 +133,42 @@ test("confirmed automation declines optional cookies when the delayed privacy pr
   assert.deepEqual(absent, { changed: false, choice: null });
 });
 
-test("the dedicated profile directory resolves safely and refuses dangerous roots", () => {
+test("the dedicated profile directory resolves safely and ignores the removed environment override", () => {
   const explicit = resolveProfileDir({ profileDir: "tmp/ah-profile-test" });
   assert.ok(explicit.endsWith("tmp/ah-profile-test"));
   assert.throws(() => resolveProfileDir({ profileDir: "/" }), /Refusing to use/);
   assert.throws(() => resolveProfileDir({ profileDir: "   " }), /non-empty path/);
-  const home = process.env.HOME;
+  const home = os.homedir();
   assert.throws(() => resolveProfileDir({ profileDir: home }), /Refusing to use/);
   const previous = process.env.AH_FLEX_PROFILE_DIR;
   try {
-    process.env.AH_FLEX_PROFILE_DIR = "tmp/env-ah-profile";
-    assert.ok(resolveProfileDir().endsWith("tmp/env-ah-profile"));
-    delete process.env.AH_FLEX_PROFILE_DIR;
-    assert.ok(resolveProfileDir().includes(".ah-flex"));
+    process.env.AH_FLEX_PROFILE_DIR = "/tmp/unsafe-ah-flex-override";
+    assert.equal(resolveProfileDir(), path.join(home, ".ah-flex", "firefox-profile"));
   } finally {
     if (previous === undefined) delete process.env.AH_FLEX_PROFILE_DIR;
     else process.env.AH_FLEX_PROFILE_DIR = previous;
   }
+});
+
+test("profile launch boundary rejects broad modes and final-component symlinks without chmodding existing targets", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-profile-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const broad = path.join(root, "broad");
+  await mkdir(broad, { mode: 0o755 });
+  await chmod(broad, 0o755);
+  await assert.rejects(() => ensureProfileDir({ profileDir: broad }), /private mode 0700/);
+  assert.equal((await lstat(broad)).mode & 0o7777, 0o755);
+
+  const real = path.join(root, "real");
+  const link = path.join(root, "link");
+  await mkdir(real, { mode: 0o700 });
+  await symlink(real, link);
+  await assert.rejects(() => ensureProfileDir({ profileDir: link }), /final-component symlink/);
+
+  const created = path.join(root, "created");
+  assert.equal(await ensureProfileDir({ profileDir: created }), created);
+  assert.equal((await lstat(created)).mode & 0o7777, 0o700);
 });
 
 test("member probe interpretation only accepts a clean authenticated member object", () => {
@@ -159,19 +183,27 @@ test("member probe interpretation only accepts a clean authenticated member obje
 
 test("live member verification requires an authenticated account session", async () => {
   const memberRequest = { headers: { "content-type": "application/json" }, body: { operationName: "member" } };
-  const productUrl = "https://www.ah.be/producten/product/wi111111/exact-wi111111";
+  const listUrl = "https://www.ah.be/mijnlijst";
+  let evaluatorInput;
+  let denied = false;
   const page = {
     goto: async () => {},
-    url: () => productUrl,
-    evaluate: async () => ({
-      status: 200,
-      jsonObject: true,
-      errorsClear: true,
-      hasMember: true,
-      memberState: "object",
-    }),
+    url: () => listUrl,
+    locator: () => ({ innerText: async () => (denied ? "Access Denied" : "Mijn lijst") }),
+    evaluate: async (_fn, input) => {
+      evaluatorInput = input;
+      return {
+        status: 200,
+        jsonObject: true,
+        errorsClear: true,
+        hasMember: true,
+        memberState: "object",
+      };
+    },
   };
-  await verifyAuthenticatedMember(page, memberRequest, productUrl);
+  await verifyAuthenticatedMember(page, memberRequest, listUrl);
+  assert.ok(Number.isInteger(evaluatorInput.timeoutMs));
+  assert.ok(evaluatorInput.timeoutMs > 0 && evaluatorInput.timeoutMs <= 15_000);
   page.evaluate = async () => ({
     status: 200,
     jsonObject: true,
@@ -180,9 +212,22 @@ test("live member verification requires an authenticated account session", async
     memberState: "null",
   });
   await assert.rejects(
-    () => verifyAuthenticatedMember(page, memberRequest, productUrl),
+    () => verifyAuthenticatedMember(page, memberRequest, listUrl),
     /not authenticated.*session login/,
   );
+  denied = true;
+  await assert.rejects(
+    () => verifyAuthenticatedMember(page, memberRequest, listUrl),
+    /Mijn lijst page is unavailable or denied.*no cart action was attempted/,
+  );
+});
+
+test("verified receipt accounting stays distinct when browser handoff cleanup fails", () => {
+  const receipt = { complete: true, target: "https://www.ah.be/mijnlijst", actions: [] };
+  const error = attachVerifiedReceipt(new BasketError("guard release failed"), receipt);
+  assert.equal(error.verifiedReceipt, receipt);
+  assert.equal(error.partialReceipt, undefined);
+  assert.ok(error.diagnostics.some((row) => row.code === "VERIFIED_CART_HANDOFF_FAILED"));
 });
 
 test("one Mijn lijst readback maps exact URLs to quantities and rejects ambiguity", () => {
@@ -229,6 +274,25 @@ test("dry-run emits exact URLs and quantities without constructing a browser ada
       { url: "https://www.ah.be/producten/product/wi333333/exact-wi333333", quantity: 3 },
     ],
   );
+});
+
+test("apply planning rejects duplicate numeric wi IDs before a browser can launch", () => {
+  const basket = actionableBasket();
+  const duplicate = {
+    ...basket,
+    items: [
+      basket.items[0],
+      {
+        ...basket.items[1],
+        selected: {
+          ...basket.items[1].selected,
+          product_id: "wi111111",
+          url: "https://www.ah.be/producten/product/wi111111/another-exact-slug",
+        },
+      },
+    ],
+  };
+  assert.throws(() => buildApplyPlan(duplicate), /Duplicate numeric AH product ID/);
 });
 
 test("confirmed orchestration adds exact lines, rereads, and reports honest mismatches", async () => {
@@ -342,6 +406,63 @@ test("an exact line present below the requested quantity is topped up, not dupli
   ]);
 });
 
+test("a later failure rebuilds an acknowledged top-up from a contradictory safe readback", async () => {
+  const fullBasket = actionableBasket();
+  const basket = { ...fullBasket, items: [fullBasket.items[0]] };
+  let reads = 0;
+  const adapter = {
+    async read() {
+      reads += 1;
+      return [{ url: basket.items[0].selected.url, quantity: reads === 2 ? 2 : 1 }];
+    },
+    async applyExactBatch(changes, onDispatch) {
+      onDispatch(changes, BASKET_ITEMS_UPDATE_OPERATION);
+      return { outcomes: changes.map((line) => ({ ...line, action: "topped-up", observed_quantity: 2 })) };
+    },
+    async readVisible() {
+      throw new Error("visible handoff read failed");
+    },
+  };
+  await assert.rejects(
+    () => applyBasketWithAdapter(basket, adapter),
+    (error) => {
+      assert.equal(error.partialReceipt.actions[0].action, "attempted");
+      assert.equal(error.partialReceipt.actions[0].observed_quantity, 1);
+      assert.equal(error.partialReceipt.observed[0].quantity, 1);
+      return true;
+    },
+  );
+});
+
+test("malformed partial readback preserves the original failure and keeps dispatched lines attempted", async () => {
+  const basket = actionableBasket();
+  const url = basket.items[0].selected.url;
+  const malformed = [
+    { url, quantity: 2 },
+    { url, quantity: 3 },
+  ];
+  let reads = 0;
+  const adapter = {
+    read: async () => {
+      reads += 1;
+      return reads === 1 ? [] : malformed.map((row) => ({ ...row }));
+    },
+    applyExactBatch: async (changes, onDispatch) => {
+      onDispatch(changes, BASKET_ITEMS_ADD_OPERATION);
+    },
+  };
+  await assert.rejects(
+    () => applyBasketWithAdapter(basket, adapter),
+    (error) => {
+      assert.match(error.message, /Ambiguous duplicate observations/);
+      assert.ok(error.partialReceipt);
+      assert.ok(error.partialReceipt.actions.every((action) => action.action === "attempted"));
+      assert.deepEqual(error.partialReceipt.observed, []);
+      return true;
+    },
+  );
+});
+
 test("a dispatched batch failure carries an honest readback-backed partial receipt", async () => {
   const basket = actionableBasket();
   const rows = [];
@@ -385,6 +506,46 @@ test("a failed add batch marks never-dispatched top-ups as not attempted", async
       assert.equal(error.partialReceipt.actions[0].action, "not-attempted");
       assert.equal(error.partialReceipt.actions[1].action, "added");
       assert.equal(error.partialReceipt.actions[2].action, "attempted");
+      return true;
+    },
+  );
+});
+
+test("partial readback refreshes non-dispatched line evidence after another line was dispatched", async () => {
+  const fullBasket = actionableBasket();
+  const basket = { ...fullBasket, items: fullBasket.items.slice(0, 2) };
+  const [preserved, added] = basket.items.map((item) => item.selected.url);
+  let reads = 0;
+  const adapter = {
+    async read() {
+      reads += 1;
+      return reads === 1
+        ? [{ url: preserved, quantity: 5 }]
+        : [
+            { url: preserved, quantity: 2 },
+            { url: added, quantity: 1 },
+          ];
+    },
+    async applyExactBatch(changes, onDispatch) {
+      const addItems = changes.filter((line) => line.url === added);
+      onDispatch(addItems, BASKET_ITEMS_ADD_OPERATION);
+      return { outcomes: [{ ...addItems[0], action: "added", observed_quantity: 1 }] };
+    },
+    async readVisible() {
+      throw new Error("visible handoff read failed");
+    },
+  };
+
+  await assert.rejects(
+    () => applyBasketWithAdapter(basket, adapter),
+    (error) => {
+      assert.equal(error.partialReceipt.actions[0].action, "already-present");
+      assert.equal(error.partialReceipt.actions[0].observed_quantity, 2);
+      assert.equal(error.partialReceipt.actions[1].action, "added");
+      assert.deepEqual(error.partialReceipt.observed.map(({ url, quantity }) => ({ url, quantity })), [
+        { url: preserved, quantity: 2 },
+        { url: added, quantity: 1 },
+      ]);
       return true;
     },
   );

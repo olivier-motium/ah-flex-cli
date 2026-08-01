@@ -5,14 +5,14 @@ import {
   BASKET_ITEMS_ADD_OPERATION,
   BASKET_ITEMS_UPDATE_OPERATION,
   buildBasketMutationPlan,
-  createBasketGraphqlAdapter,
   createBasketItemsAddRequest,
   normalizeBasketCollections,
   normalizeRequestedLines,
   parseProductIdFromUrl,
   reconcileTopUpCandidates,
   validateBasketMutationResponse,
-} from "../src/browser.js";
+} from "../src/basket-graphql.js";
+import { createBasketGraphqlAdapter } from "../src/browser.js";
 
 const lines = [
   {
@@ -238,6 +238,38 @@ test("top-up-only adapter rereads before one update and aborts on observed drift
   assert.deepEqual(operations, ["basket", "basket", BASKET_ITEMS_UPDATE_OPERATION]);
   assert.deepEqual(result.outcomes.map(({ action }) => action), ["topped-up"]);
   assert.equal(responses.length, 0);
+});
+
+test("update outcomes consume the validated mutation snapshot instead of the requested quantity", async () => {
+  const responses = [
+    { status: 200, json: { data: { basket: snapshot([{ id: 111111, quantity: 1 }]) } } },
+    { status: 200, json: { data: { basket: snapshot([{ id: 111111, quantity: 1 }]) } } },
+    {
+      status: 200,
+      json: {
+        data: {
+          basketItemsUpdate: {
+            result: snapshot([{ id: 111111, quantity: 3 }]),
+          },
+        },
+      },
+    },
+  ];
+  const operations = [];
+  const page = {
+    url: () => "https://www.ah.be/mijnlijst",
+    evaluate: async (_fn, input) => {
+      operations.push(input.body.operationName);
+      return responses.shift();
+    },
+  };
+  const adapter = createBasketGraphqlAdapter(page, [lines[0]]);
+  await adapter.read();
+  const result = await adapter.applyExactBatch([{ url: lines[0].url, quantity: 2 }], () => {});
+  assert.deepEqual(operations, ["basket", "basket", BASKET_ITEMS_UPDATE_OPERATION]);
+  assert.deepEqual(result.outcomes.map(({ action, observed_quantity }) => ({ action, observed_quantity })), [
+    { action: "kept-higher", observed_quantity: 3 },
+  ]);
 });
 
 test("GraphQL errors stop after one dispatched mutation with no automatic retry", async () => {
