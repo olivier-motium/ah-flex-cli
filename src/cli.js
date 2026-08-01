@@ -193,7 +193,8 @@ async function handleSession(args) {
   if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
   console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
   console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
-  console.log("Complete the privacy choice and account login in this window once; ah-flex never sees your credentials.");
+  console.log("A NEW Firefox window opens on the ah.be login page with a fresh, empty profile (no bookmarks, no history).");
+  console.log("Log in IN THAT NEW WINDOW — logging into your everyday Firefox does not count. ah-flex never sees your credentials.");
   const { context } = await runInteractiveLogin({
     onStatus: (state) => {
       if (state === "waiting") console.log("Waiting for the AH account session to become active…");

@@ -716,9 +716,10 @@ export async function runInteractiveLogin(options = {}) {
   try {
     const page = await activePage(context);
     await page.goto(`${AH_ORIGIN}/inloggen`, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-    const probe = await context.newPage();
+    let probe = await context.newPage();
     let announced = false;
     for (;;) {
+      if (probe.isClosed()) probe = await context.newPage();
       await ensureAhOriginPage(probe);
       const result = await probeMemberState(probe, memberRequest).catch(() => null);
       if (interpretMemberProbe(result)) {
