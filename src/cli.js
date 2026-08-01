@@ -17,9 +17,10 @@ import {
   applyBasketInVisibleBrowser,
   buildApplyPlan,
   closeVisibleAhBrowser,
-  openLoginSession,
+  runInteractiveLogin,
+  sessionStatus,
 } from "./browser.js";
-import { loadAhHarSession } from "./har-session.js";
+import { importFirefoxAhCookies } from "./firefox-session.js";
 import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
 
@@ -35,17 +36,21 @@ Usage:
   ah-flex basket review <basket.json> --out <review.html> [--open]
   ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
-  ah-flex cart apply <basket.json> [--confirm-add (--guest | --har session.har)] [--json]
+  ah-flex session status [--json]
+  ah-flex session import-firefox <source-profile-dir> --confirm-ah-cookie-copy [--json]
+  ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
-  cart apply is a dry-run unless --confirm-add is present. Browser writes use a
-  visible dedicated profile, exact product URLs, and a post-write readback.
+  cart apply is a dry-run unless --confirm-add is present. Confirmed writes stay
+  on authenticated /mijnlijst and use its pinned same-origin basket operations
+  through one dedicated persistent Firefox profile. Authenticate it with 'session
+  login', or optionally copy only AH Belgium cookie rows from a closed Firefox
+  profile with the macOS-only 'session import-firefox'. Every later run reuses
+  that session. The live member query must prove the authenticated account
+  before any basket mutation. Mutations are never retried automatically. Do not
+  edit the same basket in another tab or device while confirmed apply is running.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
-  session); --transport browser uses a fresh visible Firefox context instead.
-  --har imports only an allowlisted AH session subset into a nonpersistent
-  Firefox context and verifies the live member query before any cart click.
-  --guest prepares an unauthenticated browser cart and proves the live member is
-  null before any cart click; it never reads account/session cookies.
+  session); --transport browser reads through the same trusted profile.
   Checkout, ordering, payment, substitutions, and implicit product selection do
   not exist. After verified readback, the visible browser is released to you.`;
 }
@@ -81,14 +86,19 @@ function printValidation(result, asJson) {
   console.log(formatDiagnostics(result));
 }
 
-async function pauseVisibleBrowser(message) {
+async function pauseVisibleBrowser(message, { asJson = false } = {}) {
   if (!input.isTTY) return;
-  const terminal = readline.createInterface({ input, output });
+  const terminal = readline.createInterface({ input, output: asJson ? process.stderr : output });
   try {
     await terminal.question(`${message}\nPress Enter when you want ah-flex to close its helper browser. `);
   } finally {
     terminal.close();
   }
+}
+
+function formatReceiptAction(line) {
+  const observed = line.action === "kept-higher" ? ` (observed_quantity=${line.observed_quantity ?? "unknown"})` : "";
+  return `${line.action.toUpperCase()} ${line.quantity} × ${line.expected_name}${observed}\n  ${line.url}`;
 }
 
 function openLocalFile(filePath) {
@@ -173,16 +183,62 @@ async function handleSearch(args) {
 
 async function handleSession(args) {
   const action = args.shift();
-  rejectUnknown(args);
-  if (action !== "login") throw new BasketError("Only 'session login' is supported");
-  if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
-  const { context } = await openLoginSession();
-  try {
-    console.log("A dedicated visible AH Belgium browser is open and under your control. Complete login or verification there; ah-flex never reads the credentials.");
-    await pauseVisibleBrowser("Leave the winkelmandje visible once login is complete.");
-  } finally {
-    await closeVisibleAhBrowser(context);
+  if (action === "import-firefox") {
+    const confirmed = takeFlag(args, "--confirm-ah-cookie-copy");
+    const asJson = takeFlag(args, "--json");
+    const sourceProfileDir = args.shift();
+    rejectUnknown(args);
+    if (!confirmed) {
+      throw new BasketError("session import-firefox requires the exact --confirm-ah-cookie-copy flag");
+    }
+    if (!sourceProfileDir) {
+      throw new BasketError("session import-firefox requires a source Firefox profile directory");
+    }
+    const receipt = await importFirefoxAhCookies(sourceProfileDir);
+    if (asJson) {
+      console.log(JSON.stringify(receipt, null, 2));
+    } else {
+      console.log(`Imported ${receipt.imported_cookie_rows} AH Belgium cookie row(s) into the dedicated CLI profile.`);
+      console.log("No cookie names or values were printed. Run 'ah-flex session status' to prove authentication.");
+    }
+    return;
   }
+  const asJson = takeFlag(args, "--json");
+  rejectUnknown(args);
+  if (action === "status") {
+    const status = await sessionStatus();
+    if (asJson) {
+      console.log(JSON.stringify(status, null, 2));
+      if (status.state !== "authenticated") process.exitCode = 1;
+      return;
+    }
+    if (status.state === "authenticated") {
+      console.log("AH session is authenticated; 'cart apply --confirm-add' can use it.");
+    } else if (status.state === "anonymous") {
+      console.log("AH session is not authenticated. Run 'ah-flex session login' once in the dedicated profile.");
+    } else if (status.state === "denied") {
+      console.log("AH denied the dedicated browser profile. Try again later; run 'ah-flex session login' if it persists.");
+    } else {
+      console.log("AH session state could not be determined; try 'ah-flex session login'.");
+    }
+    if (status.state !== "authenticated") process.exitCode = 1;
+    return;
+  }
+  if (action !== "login") throw new BasketError("Use 'session login', 'session status', or 'session import-firefox'");
+  if (asJson) throw new BasketError("session login does not support --json because it requires an interactive browser handoff");
+  if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
+  console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
+  console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
+  console.log("A dedicated Firefox window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported).");
+  console.log("Log in IN THAT NEW WINDOW — logging into your everyday Firefox does not count. ah-flex never sees your credentials.");
+  const { context } = await runInteractiveLogin({
+    onStatus: (state) => {
+      if (state === "waiting") console.log("Waiting for the AH account session to become active…");
+    },
+  });
+  await closeVisibleAhBrowser(context);
+  console.log("AH session authenticated and saved to the dedicated profile.");
+  console.log("Future 'ah-flex cart apply --confirm-add' runs reuse it. Checkout and payment stay manual.");
 }
 
 async function handleCart(args) {
@@ -190,15 +246,10 @@ async function handleCart(args) {
   const filePath = args.shift();
   if (action !== "apply" || !filePath) throw new BasketError("Use 'cart apply <basket.json>'");
   const confirmed = takeFlag(args, "--confirm-add");
-  const guest = takeFlag(args, "--guest");
-  const harPath = takeFlag(args, "--har", { value: true });
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   const basket = await loadBasket(path.resolve(filePath));
   if (!confirmed) {
-    if (harPath || guest) {
-      throw new BasketError("--guest and --har are only accepted with --confirm-add");
-    }
     const plan = buildApplyPlan(basket);
     if (asJson) console.log(JSON.stringify(plan, null, 2));
     else {
@@ -211,50 +262,85 @@ async function handleCart(args) {
   if (!input.isTTY) {
     throw new BasketError("--confirm-add requires an interactive terminal so the verified browser can be handed to you");
   }
-  if (guest === Boolean(harPath)) {
-    throw new BasketError("--confirm-add requires exactly one of --guest or --har <session.har>");
-  }
-  if (harPath && basket.items.length !== 1) {
-    throw new BasketError("HAR-backed confirmed apply currently supports exactly one exact product line");
-  }
-  const harSession = harPath ? await loadAhHarSession(path.resolve(harPath)) : null;
 
   let context = null;
+  let operationError = null;
   try {
-    const result = await applyBasketInVisibleBrowser(basket, {
-      harSession,
-      sessionMode: guest ? "guest" : "har",
-    });
+    const result = await applyBasketInVisibleBrowser(basket);
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {
-      console.log("Visible winkelmandje readback matched every exact product URL and requested quantity.");
-      for (const line of result.receipt.actions) console.log(`${line.action.toUpperCase()} ${line.quantity} × ${line.expected_name}`);
+      console.log("Fresh GraphQL and reloaded visible winkelmandje readback matched every exact product and quantity.");
+      for (const line of result.receipt.actions) console.log(formatReceiptAction(line));
       for (const warning of result.receipt.warnings) console.log(`ATTENTION ${warning}`);
     }
-    await pauseVisibleBrowser("The verified winkelmandje is open and browser control is now yours. You may log in and buy manually; ah-flex cannot operate checkout or payment.");
+    await pauseVisibleBrowser(
+      "The verified winkelmandje is open and browser control is now yours. You may log in and buy manually; ah-flex cannot operate checkout or payment.",
+      { asJson },
+    );
   } catch (error) {
+    operationError = error;
     context = error.browserContext ?? context;
-    if (error.partialReceipt) {
-      if (asJson) {
-        console.error(JSON.stringify({ partial_receipt: error.partialReceipt }, null, 2));
-      } else {
-        console.error("PARTIAL RECEIPT — one or more earlier lines may already have changed:");
-        for (const line of error.partialReceipt.actions) {
-          console.error(`${line.action.toUpperCase()} ${line.quantity} × ${line.expected_name}\n  ${line.url}`);
+    try {
+      if (error.verifiedReceipt) {
+        if (asJson) {
+          console.log(JSON.stringify({ verified_receipt: error.verifiedReceipt }, null, 2));
+        } else {
+          console.error("VERIFIED CART — cart readbacks succeeded, but browser handoff cleanup failed:");
+          for (const line of error.verifiedReceipt.actions) {
+            console.error(formatReceiptAction(line));
+          }
         }
-        for (const row of error.partialReceipt.observed) {
-          console.error(`OBSERVED ${row.quantity ?? "?"} × ${row.url}`);
+        if (context) {
+          console.error("The verified cart is being kept open while the browser handoff failure is reported.");
+          await pauseVisibleBrowser("The verified cart is open for inspection.", { asJson });
+        }
+      } else if (error.partialReceipt) {
+        if (asJson) {
+          console.error(JSON.stringify({ partial_receipt: error.partialReceipt }, null, 2));
+        } else {
+          console.error("PARTIAL RECEIPT — one or more earlier lines may already have changed:");
+          for (const line of error.partialReceipt.actions) {
+            console.error(formatReceiptAction(line));
+          }
+          for (const row of error.partialReceipt.observed) {
+            console.error(`OBSERVED ${row.quantity ?? "?"} × ${row.url}`);
+          }
         }
       }
-    }
-    if (context) {
-      console.error("The browser operation stopped before verified completion. Inspect the visible cart; ah-flex cannot operate checkout.");
-      await pauseVisibleBrowser("The visible page is being kept open for diagnosis.");
+      if (context && error.partialReceipt) {
+        console.error("The browser operation stopped before verified completion. Inspect the visible cart; ah-flex cannot operate checkout.");
+        await pauseVisibleBrowser("The visible page is being kept open for diagnosis.", { asJson });
+      }
+    } catch (reportError) {
+      error.diagnostics = [
+        ...(error.diagnostics ?? []),
+        {
+          level: "error",
+          code: "BROWSER_HANDOFF_REPORT_FAILED",
+          path: "browser",
+          message: `The original cart failure was preserved after its interactive report failed: ${reportError.message}`,
+        },
+      ];
     }
     throw error;
   } finally {
-    if (context) await closeVisibleAhBrowser(context);
+    if (context) {
+      try {
+        await closeVisibleAhBrowser(context);
+      } catch (closeError) {
+        if (!operationError) throw closeError;
+        operationError.diagnostics = [
+          ...(operationError.diagnostics ?? []),
+          {
+            level: "error",
+            code: "BROWSER_CLOSE_FAILED",
+            path: "browser",
+            message: `The original cart failure was preserved after the helper browser could not close: ${closeError.message}`,
+          },
+        ];
+      }
+    }
   }
 }
 
