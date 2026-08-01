@@ -14,23 +14,22 @@ touches payment.
 
 - This is a custom personal-use browser helper, not an official AH integration.
 - It does not guess or call an undocumented cart mutation API. One pinned,
-  read-only `member` query is used only to prove that the final context is
-  explicitly anonymous or authenticated before any cart click.
+  read-only `member` query is used only to prove that the trusted profile holds
+  an authenticated account session before any cart click.
 - Search reads fetch the same public `www.ah.be` pages a browser loads, over
   plain HTTPS with the browser's request headers (AH-authorized browser
   mimicry; the edge otherwise answers Access Denied on `/zoeken`). Product
   facts come from the structured payload embedded in those pages, not from
   screen scraping. No cookies or session values are sent or stored for reads.
-- With explicit `--har`, it imports only six allowlisted AH session/routing
-  cookies into a fresh nonpersistent Firefox context. Akamai cookies are
-  excluded, values are never logged, and a live `member` query must prove the
-  session before any cart click.
-- With explicit `--guest`, a throwaway Firefox context selects **Weigeren** in
-  AH's consent dialog. Only `consentBeta` and `consentSettings` are copied into
-  a second fresh context; account, HAR, routing, and Akamai cookies are not.
-  The pinned live member query must return an explicit `null` member before the
-  guest cart can change.
-- Password entry and verification stay outside the CLI.
+- Browser writes use one dedicated persistent Firefox profile owned by the CLI
+  (default `~/.ah-flex/firefox-profile`, override with `AH_FLEX_PROFILE_DIR`,
+  created `0700`). You complete the privacy choice and account login in that
+  visible profile exactly once; the CLI then reuses the same trusted browser
+  for every run. A login in your normal browser or any other profile does not
+  transfer — sessions are bound to the profile that earned them.
+- Password entry, verification codes, and the privacy choice stay outside the
+  CLI. The CLI never reads, exports, or stores cookies or credentials; the
+  profile on disk is the session, and only Firefox reads it.
 - Cart/list changes are dry-run by default and require an explicit execution
   flag. Checkout and payment automation do not exist. Once exact line/quantity
   readback succeeds, browser control is released for the human handoff.
@@ -66,9 +65,9 @@ ah-flex --help
 ```
 
 Confirmed writes use stock Firefox through Playwright's WebDriver BiDi channel.
-All helper contexts are nonpersistent. Guest consent is bootstrapped entirely in
-memory, and an explicitly supplied HAR session exists only for that process;
-neither is copied into a browser profile.
+All automation runs in the single dedicated persistent profile, so the site
+sees the same returning browser you logged into once — not a fresh throwaway
+profile on every run.
 
 ## Command surface
 
@@ -78,14 +77,19 @@ ah-flex basket check basket.json [--json]
 ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
 ah-flex session login
+ah-flex session status
 ah-flex cart apply basket.json                 # dry-run
-ah-flex cart apply basket.json --confirm-add --guest
-ah-flex cart apply basket.json --confirm-add --har /path/to/AH.har
+ah-flex cart apply basket.json --confirm-add
 ```
 
 `search` defaults to the HTTP transport, which needs no login and no browser.
-`--transport browser` keeps the original visible-browser read as a diagnostic
+`--transport browser` reads through the trusted profile as a diagnostic
 fallback. Neither transport retries automatically after an Access Denied.
+
+`session login` opens the dedicated profile on ah.be and waits until the pinned
+member query proves the account session is active, then closes the browser.
+`session status` probes the saved profile without changing anything and exits
+non-zero unless the session is authenticated.
 
 During automation, the browser adapter targets bounded pages on
 `https://www.ah.be/` only and fails closed when the site's accessible controls
@@ -104,14 +108,15 @@ continue to login, ordering, or payment.
    into each `selected` field.
 4. Run `basket check`, generate the static review, then run `cart apply` without
    the execution flag. Unresolved, unavailable, or stale lines block apply.
-5. After reviewing the exact dry-run, use `--confirm-add --guest` for a fresh
-   unauthenticated cart or `--confirm-add --har ...` for a captured account
-   session. The CLI proves the live member state, changes the winkelmandje,
-   rereads every exact URL and quantity, and hands the visible browser to the
-   user. The HAR-backed path currently accepts one exact product line per run;
-   guest mode accepts the actionable basket. Confirmed commands require an
-   interactive terminal so the final browser handoff cannot disappear into a
-   background job.
+5. After reviewing the exact dry-run, use `--confirm-add`. The CLI proves the
+   saved profile is authenticated, changes the winkelmandje, rereads every
+   exact URL and quantity, and hands the visible browser to the user. An exact
+   line that is already present at the requested quantity is reported
+   `already-present` and left untouched; an exact line present at a different
+   quantity stops the run rather than silently changing it. Confirmed commands
+   require an interactive terminal so the final browser handoff cannot
+   disappear into a background job. If the saved session has expired, the CLI
+   stops before any click and asks for one `ah-flex session login`.
 
 The checked-in chicken-and-beef example is intentionally unresolved: it is the
 recombinable component brief, not fake or stale product data.
@@ -126,29 +131,24 @@ had denied both curl and the automated browser profile on `/zoeken`. The
 browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
 denying it, refresh the pinned Chrome version there.
 
-The first Chromium write canary reached an add click but could not verify the
-state transition; its partial receipt was treated as ambiguous. The completed
-Firefox guest canary on 2026-07-31 used exact product `wi481844`, added one
-`AH Tomaten passata gezeefd`, reread that exact URL at quantity `1`, and opened
-the verified `/mijnlijst` cart. The CLI receipt reported `ADDED`; the visible
-cart total was €0.59. Checkout and payment were not opened.
-
-The supplied HAR still parses against the pinned member request, but its live
-session no longer proves an authenticated member. That path therefore stops
-before any cart click, as designed. Guest mode does not read the HAR.
+The earlier fresh-profile session modes (guest consent bootstrap and HAR cookie
+transplant) were removed on 2026-08-01 after the live guest write was denied
+before the first click: a brand-new throwaway profile cannot carry the site's
+trust, no matter which cookies are copied into it. The dedicated persistent
+profile replaces them — one human login, then the same returning browser for
+every run.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
 action.
 
-## HAR boundary
+## Session boundary
 
-The supplied capture contains authenticated read queries but no cart mutation,
-so the CLI never replays it or guesses a GraphQL write. `--har` uses the newest
-successful basket request only to obtain a narrow cookie allowlist and requires
-the capture to contain the exact pinned member query used by the CLI's live
-authentication check. Everything stays in memory; raw HAR content and cookie
-values never enter output, receipts, tests, or Git.
+The CLI never replays captured traffic or guesses a GraphQL write, and it never
+imports cookies or credentials from anywhere. The dedicated profile is created
+empty, earns its session from exactly one visible human login, and is reused
+verbatim afterwards. Raw session material never enters output, receipts, tests,
+or Git.
 
 The implementation is custom. Public grocery MCPs informed the generic safety
 shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or

@@ -17,9 +17,9 @@ import {
   applyBasketInVisibleBrowser,
   buildApplyPlan,
   closeVisibleAhBrowser,
-  openLoginSession,
+  runInteractiveLogin,
+  sessionStatus,
 } from "./browser.js";
-import { loadAhHarSession } from "./har-session.js";
 import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
 
@@ -35,17 +35,18 @@ Usage:
   ah-flex basket review <basket.json> --out <review.html> [--open]
   ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
-  ah-flex cart apply <basket.json> [--confirm-add (--guest | --har session.har)] [--json]
+  ah-flex session status
+  ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Browser writes use a
-  visible dedicated profile, exact product URLs, and a post-write readback.
+  single dedicated persistent Firefox profile: run 'ah-flex session login' once,
+  complete the privacy choice and account login in the visible window, and every
+  later run reuses that trusted session. A login in any other browser or profile
+  does not transfer; the dedicated profile needs its own one-time login. The
+  live member query must prove the authenticated account before any cart click.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
-  session); --transport browser uses a fresh visible Firefox context instead.
-  --har imports only an allowlisted AH session subset into a nonpersistent
-  Firefox context and verifies the live member query before any cart click.
-  --guest prepares an unauthenticated browser cart and proves the live member is
-  null before any cart click; it never reads account/session cookies.
+  session); --transport browser reads through the same trusted profile.
   Checkout, ordering, payment, substitutions, and implicit product selection do
   not exist. After verified readback, the visible browser is released to you.`;
 }
@@ -174,15 +175,33 @@ async function handleSearch(args) {
 async function handleSession(args) {
   const action = args.shift();
   rejectUnknown(args);
-  if (action !== "login") throw new BasketError("Only 'session login' is supported");
-  if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
-  const { context } = await openLoginSession();
-  try {
-    console.log("A dedicated visible AH Belgium browser is open and under your control. Complete login or verification there; ah-flex never reads the credentials.");
-    await pauseVisibleBrowser("Leave the winkelmandje visible once login is complete.");
-  } finally {
-    await closeVisibleAhBrowser(context);
+  if (action === "status") {
+    const status = await sessionStatus();
+    if (status.state === "authenticated") {
+      console.log("AH session is authenticated; 'cart apply --confirm-add' can use it.");
+    } else if (status.state === "anonymous") {
+      console.log("AH session is not authenticated. Run 'ah-flex session login' once in the dedicated profile.");
+    } else if (status.state === "denied") {
+      console.log("AH denied the dedicated browser profile. Try again later; run 'ah-flex session login' if it persists.");
+    } else {
+      console.log("AH session state could not be determined; try 'ah-flex session login'.");
+    }
+    if (status.state !== "authenticated") process.exitCode = 1;
+    return;
   }
+  if (action !== "login") throw new BasketError("Use 'session login' or 'session status'");
+  if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
+  console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
+  console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
+  console.log("Complete the privacy choice and account login in this window once; ah-flex never sees your credentials.");
+  const { context } = await runInteractiveLogin({
+    onStatus: (state) => {
+      if (state === "waiting") console.log("Waiting for the AH account session to become active…");
+    },
+  });
+  await closeVisibleAhBrowser(context);
+  console.log("AH session authenticated and saved to the dedicated profile.");
+  console.log("Future 'ah-flex cart apply --confirm-add' runs reuse it. Checkout and payment stay manual.");
 }
 
 async function handleCart(args) {
@@ -190,15 +209,10 @@ async function handleCart(args) {
   const filePath = args.shift();
   if (action !== "apply" || !filePath) throw new BasketError("Use 'cart apply <basket.json>'");
   const confirmed = takeFlag(args, "--confirm-add");
-  const guest = takeFlag(args, "--guest");
-  const harPath = takeFlag(args, "--har", { value: true });
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   const basket = await loadBasket(path.resolve(filePath));
   if (!confirmed) {
-    if (harPath || guest) {
-      throw new BasketError("--guest and --har are only accepted with --confirm-add");
-    }
     const plan = buildApplyPlan(basket);
     if (asJson) console.log(JSON.stringify(plan, null, 2));
     else {
@@ -211,20 +225,10 @@ async function handleCart(args) {
   if (!input.isTTY) {
     throw new BasketError("--confirm-add requires an interactive terminal so the verified browser can be handed to you");
   }
-  if (guest === Boolean(harPath)) {
-    throw new BasketError("--confirm-add requires exactly one of --guest or --har <session.har>");
-  }
-  if (harPath && basket.items.length !== 1) {
-    throw new BasketError("HAR-backed confirmed apply currently supports exactly one exact product line");
-  }
-  const harSession = harPath ? await loadAhHarSession(path.resolve(harPath)) : null;
 
   let context = null;
   try {
-    const result = await applyBasketInVisibleBrowser(basket, {
-      harSession,
-      sessionMode: guest ? "guest" : "har",
-    });
+    const result = await applyBasketInVisibleBrowser(basket);
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {
