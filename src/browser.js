@@ -736,7 +736,14 @@ export async function runInteractiveLogin(options = {}) {
     let probe = await context.newPage();
     let announced = false;
     for (;;) {
-      if (probe.isClosed()) probe = await context.newPage();
+      if (probe.isClosed()) {
+        probe = await context.newPage().catch(() => null);
+        if (!probe) {
+          throw new BasketError(
+            "The login window was closed before the session became active; run 'ah-flex session login' again to continue",
+          );
+        }
+      }
       await ensureAhOriginPage(probe);
       const result = await probeMemberState(probe, memberRequest).catch(() => null);
       if (interpretMemberProbe(result)) {
