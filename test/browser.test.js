@@ -5,12 +5,19 @@ import {
   assertAllowedAutomationUrl,
   assertCookiePopupAbsent,
   buildApplyPlan,
+  ensureNecessaryCookiePreference,
   extractPdpQuantity,
   findPdpAddButton,
   findPdpPlusButton,
+  findVisibleListPlusButton,
+  inspectBasketUpdateResponse,
   interpretMemberProbe,
+  isAhBasketUpdateResponse,
+  isAhCartWriteResponse,
   isAllowedAutomationUrl,
   normalizeProductCandidate,
+  normalizeVisibleListRows,
+  readGraphqlOperationNames,
   resolveProfileDir,
   verifyAuthenticatedMember,
   visibleFirefoxLaunchOptions,
@@ -97,6 +104,35 @@ test("the trusted profile fails closed if the consent UI reappears", async () =>
   await assertCookiePopupAbsent(page);
   page.locator = () => ({ isVisible: async () => true });
   await assert.rejects(() => assertCookiePopupAbsent(page), /privacy choice reappeared/);
+});
+
+test("confirmed automation declines optional cookies when the delayed privacy prompt appears", async () => {
+  const waits = [];
+  let clicked = false;
+  const decline = {
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => {
+      clicked = true;
+    },
+  };
+  const declineLocator = { count: async () => 1, nth: () => decline };
+  const popup = {
+    waitFor: async ({ state }) => {
+      waits.push(state);
+    },
+    locator: () => declineLocator,
+    getByRole: () => assert.fail("exact decline control should be preferred"),
+  };
+  const result = await ensureNecessaryCookiePreference({ locator: () => popup });
+  assert.deepEqual(result, { changed: true, choice: "necessary-only" });
+  assert.equal(clicked, true);
+  assert.deepEqual(waits, ["visible", "hidden"]);
+
+  const absent = await ensureNecessaryCookiePreference({
+    locator: () => ({ waitFor: async () => { throw new Error("not visible"); } }),
+  });
+  assert.deepEqual(absent, { changed: false, choice: null });
 });
 
 test("the dedicated profile directory resolves safely and refuses dangerous roots", () => {
@@ -195,6 +231,126 @@ test("PDP control lookup ignores page-wide recommendation buttons", async () => 
   assert.equal(await findPdpAddButton(page), null);
   assert.equal(await findPdpPlusButton(page), null);
   assert.equal(pageWideRoleLookups, 0);
+});
+
+test("PDP quantity lookup accepts the current bare Verhoog label inside hero actions", async () => {
+  const button = { isVisible: async () => true };
+  const oneButton = { count: async () => 1, nth: () => button };
+  const empty = { count: async () => 0, nth: () => assert.fail("empty locator has no rows") };
+  const hero = {
+    getByRole: (_role, { name }) => {
+      assert.equal(name.test("Verhoog"), true);
+      return oneButton;
+    },
+  };
+  let calls = 0;
+  const page = {
+    locator: () => {
+      calls += 1;
+      return calls === 1 ? hero : empty;
+    },
+  };
+  assert.equal(await findPdpPlusButton(page), button);
+});
+
+test("Mijn lijst quantity lookup stays scoped to the exact product card", async () => {
+  const button = { isVisible: async () => true };
+  const oneButton = { count: async () => 1, nth: () => button };
+  const empty = { count: async () => 0, nth: () => assert.fail("empty locator has no rows") };
+  const container = {
+    locator: () => empty,
+    getByRole: (_role, { name }) => {
+      assert.equal(name.test("Verhoog"), true);
+      return oneButton;
+    },
+  };
+  assert.equal(await findVisibleListPlusButton(container), button);
+});
+
+test("cart persistence waits only for the browser's same-origin AH GraphQL POST", () => {
+  const response = (url, method = "POST", body = { operationName: "ChangeBasket" }) => ({
+    url: () => url,
+    request: () => ({ method: () => method, postDataJSON: () => body }),
+  });
+  const cartResponse = response("https://www.ah.be/gql");
+  assert.equal(isAhCartWriteResponse(cartResponse), true);
+  assert.deepEqual(readGraphqlOperationNames(cartResponse), ["ChangeBasket"]);
+  assert.deepEqual(
+    readGraphqlOperationNames(response("https://www.ah.be/gql", "POST", [{ operationName: "One" }, { operationName: "Two" }])),
+    ["One", "Two"],
+  );
+  assert.equal(isAhCartWriteResponse(response("https://www.ah.be/gql", "GET")), false);
+  assert.equal(isAhCartWriteResponse(response("https://www.ah.be/events")), false);
+  assert.equal(isAhCartWriteResponse(response("https://evil.example/gql")), false);
+  assert.equal(isAhCartWriteResponse(null), false);
+});
+
+test("basket update inspection exposes only acknowledgement shape and bounded error codes", async () => {
+  const summary = await inspectBasketUpdateResponse({
+    json: async () => ({
+      data: { basketItemsUpdate: { result: null, private: "not projected" } },
+      errors: [
+        { message: "not projected", extensions: { code: "CONFLICT" } },
+        { message: "also not projected" },
+      ],
+    }),
+  });
+  assert.deepEqual(summary, {
+    hasBasketUpdate: true,
+    resultObject: false,
+    errorCount: 2,
+    errorCodes: ["CONFLICT"],
+  });
+  assert.equal(JSON.stringify(summary).includes("not projected"), false);
+  const updateResponse = {
+    url: () => "https://www.ah.be/gql",
+    request: () => ({ method: () => "POST" }),
+    json: async () => ({ data: { basketItemsUpdate: { result: {} } } }),
+  };
+  assert.equal(await isAhBasketUpdateResponse(updateResponse), true);
+  assert.equal(
+    await isAhBasketUpdateResponse({
+      ...updateResponse,
+      json: async () => ({ data: { basketItemsUpdate: { result: null } } }),
+    }),
+    true,
+  );
+  assert.equal(
+    await isAhBasketUpdateResponse({ ...updateResponse, json: async () => ({ data: { member: {} } }) }),
+    false,
+  );
+});
+
+test("one Mijn lijst readback maps exact URLs to quantities and rejects ambiguity", () => {
+  const lines = [
+    {
+      url: "https://www.ah.be/producten/product/wi111111/exact-one",
+      expected_name: "Exact one",
+    },
+    {
+      url: "https://www.ah.be/producten/product/wi222222/exact-two",
+      expected_name: "Exact two",
+    },
+  ];
+  assert.deepEqual(
+    normalizeVisibleListRows(
+      [
+        { href: `${lines[0].url}?source=list`, values: ["2"] },
+        { href: lines[0].url, values: ["2"] },
+        { href: "https://www.ah.be/producten/product/wi999999/unrelated", values: ["9"] },
+      ],
+      lines,
+    ),
+    [{ url: lines[0].url, name: "Exact one", quantity: 2 }],
+  );
+  assert.throws(
+    () => normalizeVisibleListRows([{ href: lines[0].url, values: ["1", "2"] }], lines),
+    /ambiguous Mijn lijst quantities: 1, 2/,
+  );
+  assert.throws(
+    () => normalizeVisibleListRows([{ href: lines[0].url, values: [] }], lines),
+    /ambiguous Mijn lijst quantities: none/,
+  );
 });
 
 test("dry-run emits exact URLs and quantities without constructing a browser adapter", () => {
@@ -327,7 +483,7 @@ test("a later mutation failure carries an honest partial receipt", async () => {
       assert.equal(error.partialReceipt.complete, false);
       assert.equal(error.partialReceipt.actions[0].action, "added");
       assert.equal(error.partialReceipt.actions[1].action, "attempted");
-      assert.equal(error.partialReceipt.observed.length, 1);
+      assert.equal(error.partialReceipt.observed.length, 0);
       assert.ok(error.diagnostics.some((row) => row.code === "PARTIAL_CART_CHANGE"));
       return true;
     },

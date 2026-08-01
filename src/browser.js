@@ -241,7 +241,12 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
       }
       const action = { ...line, action: "attempted", ...(existing ? { from_quantity: existing.quantity ?? null } : {}) };
       actions.push(action);
-      await adapter.addExact({ url: line.url, quantity: line.quantity, expectedName: line.expected_name });
+      await adapter.addExact({
+        url: line.url,
+        quantity: line.quantity,
+        expectedName: line.expected_name,
+        currentQuantity: existing?.quantity ?? 0,
+      });
       action.action = existing ? "topped-up" : "added";
       expectedFinal.set(line.url, line.quantity);
     }
@@ -275,13 +280,6 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
       warnings: [...warnings, "Current prices are visible for human review but are not a hard DOM readback predicate."],
     };
   } catch (cause) {
-    if (!afterRows.length && actions.some((action) => action.action === "attempted" || action.action === "added")) {
-      try {
-        afterRows = await adapter.read();
-      } catch {
-        // The attempted lines below remain the authoritative partial-change warning.
-      }
-    }
     const error =
       cause instanceof BasketError ? cause : new BasketError(cause instanceof Error ? cause.message : String(cause));
     error.partialReceipt = {
@@ -423,8 +421,8 @@ export function interpretMemberProbe(result) {
   );
 }
 
-export async function verifyAuthenticatedMember(page, memberRequest, productUrl) {
-  await safeGoto(page, assertExactProductUrl(productUrl));
+export async function verifyAuthenticatedMember(page, memberRequest, targetUrl) {
+  await safeGoto(page, assertAllowedAutomationUrl(targetUrl));
   const result = await probeMemberState(page, memberRequest);
   if (!interpretMemberProbe(result)) {
     throw new BasketError(
@@ -507,6 +505,33 @@ export async function assertCookiePopupAbsent(page) {
       "The AH privacy choice reappeared in the trusted profile; run 'ah-flex session login' and redo it there. No cart click was attempted",
     );
   }
+}
+
+export async function ensureNecessaryCookiePreference(page, options = {}) {
+  const popup = page.locator('[data-testid="cookie-popup"]');
+  const appeared = await popup
+    .waitFor({ state: "visible", timeout: options.timeoutMs ?? 5_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!appeared) return { changed: false, choice: null };
+
+  const decline =
+    (await firstVisible(popup.locator('[data-testid="decline-cookies"]'))) ??
+    (await firstVisible(popup.getByRole("button", { name: /^weigeren$/i })));
+  if (!decline || !(await decline.isEnabled())) {
+    throw new BasketError(
+      "The AH privacy prompt appeared without its necessary-cookies-only choice; no cart click was attempted",
+    );
+  }
+  try {
+    await decline.click({ timeout: 12_000 });
+    await popup.waitFor({ state: "hidden", timeout: 12_000 });
+  } catch {
+    throw new BasketError(
+      "The AH privacy prompt could not be set to necessary cookies only; no cart click was attempted",
+    );
+  }
+  return { changed: true, choice: "necessary-only" };
 }
 
 const PDP_HERO_ACTIONS =
@@ -598,6 +623,219 @@ async function waitForPdpQuantity(page, expected, url) {
   throw new BasketError(`Exact product ${url} did not reach visible quantity ${expected}`);
 }
 
+export function isAhCartWriteResponse(response) {
+  try {
+    const request = response.request();
+    const url = new URL(response.url());
+    return request.method() === "POST" && url.origin === AH_ORIGIN && url.pathname === "/gql";
+  } catch {
+    return false;
+  }
+}
+
+export function readGraphqlOperationNames(response) {
+  try {
+    const body = response.request().postDataJSON();
+    const operations = Array.isArray(body) ? body : [body];
+    return operations
+      .map((entry) => entry?.operationName)
+      .filter((name) => typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name));
+  } catch {
+    return [];
+  }
+}
+
+export async function inspectBasketUpdateResponse(response) {
+  try {
+    const payload = await response.json();
+    const entries = Array.isArray(payload) ? payload : [payload];
+    const errorCodes = new Set();
+    let hasBasketUpdate = false;
+    let resultObject = false;
+    let errorCount = 0;
+    for (const entry of entries) {
+      const data = entry?.data;
+      if (data && typeof data === "object" && !Array.isArray(data) && "basketItemsUpdate" in data) {
+        hasBasketUpdate = true;
+        const result = data.basketItemsUpdate?.result;
+        if (result && typeof result === "object" && !Array.isArray(result)) resultObject = true;
+      }
+      if (Array.isArray(entry?.errors)) {
+        errorCount += entry.errors.length;
+        for (const error of entry.errors) {
+          const code = error?.extensions?.code;
+          if (typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code)) errorCodes.add(code);
+        }
+      }
+    }
+    return {
+      hasBasketUpdate,
+      resultObject,
+      errorCount,
+      errorCodes: [...errorCodes].sort(),
+    };
+  } catch {
+    return { hasBasketUpdate: false, resultObject: false, errorCount: 0, errorCodes: [] };
+  }
+}
+
+function formatGraphqlSummary(summary) {
+  const codes = summary.errorCodes.join(", ") || (summary.errorCount ? "unclassified" : "none");
+  return `basket update ${summary.hasBasketUpdate ? "present" : "missing"}; result ${summary.resultObject ? "object" : "missing"}; ${summary.errorCount} error(s); codes ${codes}`;
+}
+
+export async function isAhBasketUpdateResponse(response) {
+  if (!isAhCartWriteResponse(response)) return false;
+  return (await inspectBasketUpdateResponse(response)).hasBasketUpdate;
+}
+
+async function clickAndConfirmServerQuantity(
+  page,
+  control,
+  expected,
+  url,
+  label,
+  waitForQuantity = (quantity) => waitForPdpQuantity(page, quantity, url),
+) {
+  const observedOperations = new Set();
+  const observeResponse = (response) => {
+    if (!isAhCartWriteResponse(response)) return;
+    for (const name of readGraphqlOperationNames(response)) observedOperations.add(name);
+  };
+  page.on("response", observeResponse);
+  const responsePromise = page
+    .waitForResponse(isAhBasketUpdateResponse, { timeout: 15_000 })
+    .catch(() => null);
+  try {
+    try {
+      await control.click({ timeout: 12_000 });
+    } catch {
+      throw new BasketError(`The ${label} for exact product ${url} could not be clicked`);
+    }
+    const response = await responsePromise;
+    if (!response || !response.ok()) {
+      throw new BasketError(
+        `AH did not acknowledge the ${label} for exact product ${url}; its cart state remains unverified`,
+      );
+    }
+    const responseSummary = await inspectBasketUpdateResponse(response);
+    if (responseSummary.errorCount || !responseSummary.resultObject) {
+      throw new BasketError(
+        `AH rejected the ${label} for exact product ${url}; ${formatGraphqlSummary(responseSummary)}`,
+      );
+    }
+    try {
+      await waitForQuantity(expected);
+    } catch {
+      const operations = [...observedOperations].sort().join(", ") || "none";
+      throw new BasketError(
+        `Exact product ${url} did not reach visible quantity ${expected}; ${formatGraphqlSummary(responseSummary)}; observed AH GraphQL operations: ${operations}`,
+      );
+    }
+    assertAllowedAutomationUrl(page.url());
+    await assertCookiePopupAbsent(page);
+  } finally {
+    page.off("response", observeResponse);
+  }
+}
+
+async function readVisibleListLineQuantity(container, url) {
+  const inputs = container.locator("input");
+  const observed = new Set();
+  for (let index = 0; index < (await inputs.count()); index += 1) {
+    const input = inputs.nth(index);
+    if (!(await input.isVisible())) continue;
+    const value = await input.inputValue().catch(() => null);
+    if (value === null || String(value).trim() === "") continue;
+    const quantity = Number(value);
+    if (Number.isInteger(quantity) && quantity >= 1) observed.add(quantity);
+  }
+  if (observed.size !== 1) {
+    const detail = observed.size ? [...observed].sort((a, b) => a - b).join(", ") : "none";
+    throw new BasketError(`Exact product ${url} has ambiguous Mijn lijst quantities: ${detail}`);
+  }
+  return [...observed][0];
+}
+
+async function waitForVisibleListLineQuantity(page, container, expected, url) {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    let observed = null;
+    try {
+      observed = await readVisibleListLineQuantity(container, url);
+    } catch {
+      // The list card can briefly replace its quantity widget after a write.
+    }
+    if (observed === expected) return;
+    if (Number.isInteger(observed) && observed > expected) {
+      throw new BasketError(`Exact product ${url} advanced past quantity ${expected} to ${observed}`);
+    }
+    if (attempt < 79) await page.waitForTimeout(100);
+  }
+  throw new BasketError(`Exact product ${url} did not reach visible quantity ${expected}`);
+}
+
+async function findVisibleListLine(page, url) {
+  const productId = new URL(assertExactProductUrl(url)).pathname.match(/\/(wi\d+)(?:\/|$)/)?.[1];
+  const links = page.locator(`a[href*="/producten/product/${productId}/"]`);
+  for (let index = 0; index < (await links.count()); index += 1) {
+    const link = links.nth(index);
+    if (!(await link.isVisible())) continue;
+    if (canonicalProductHref(await link.getAttribute("href")) !== canonicalProductHref(url)) continue;
+    const container = link.locator(
+      'xpath=ancestor::*[self::article or self::li or contains(@data-testid, "product") or contains(@data-testhook, "product")][1]',
+    );
+    if ((await container.count()) && (await container.first().isVisible())) return container.first();
+  }
+  return null;
+}
+
+export async function findVisibleListPlusButton(container) {
+  return (
+    (await firstVisible(
+      container.locator(
+        '[data-testid*="quantity-stepper-increase"], [data-testhook*="quantity-stepper-increase"], [data-testid*="increase"], [data-testhook*="increase"]',
+      ),
+    )) ??
+    (await firstVisible(
+      container.getByRole("button", { name: /^(?:verhoog(?: (?:het )?aantal.*)?|plus|\+)$/i }),
+    ))
+  );
+}
+
+async function topUpExactOnVisibleList(page, line) {
+  if (new URL(page.url()).pathname !== "/mijnlijst") {
+    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
+    await settle(page, { waitForProducts: true });
+  }
+  if (await readAccessDenied(page)) throw new BasketError(ACCESS_DENIED_MESSAGE);
+  await assertCookiePopupAbsent(page);
+  const container = await findVisibleListLine(page, line.url);
+  if (!container) {
+    throw new BasketError(`Exact product ${line.url} disappeared from Mijn lijst before its top-up`);
+  }
+  let currentQuantity = await readVisibleListLineQuantity(container, line.url);
+  if (currentQuantity !== line.currentQuantity) {
+    throw new BasketError(
+      `Exact product ${line.url} changed from preflight quantity ${line.currentQuantity} to ${currentQuantity}; refusing a stale top-up`,
+    );
+  }
+  while (currentQuantity < line.quantity) {
+    const plus = await findVisibleListPlusButton(container);
+    if (!plus || !(await plus.isEnabled())) {
+      throw new BasketError(`Quantity control for exact product ${line.url} could not be used on Mijn lijst`);
+    }
+    await clickAndConfirmServerQuantity(
+      page,
+      plus,
+      currentQuantity + 1,
+      line.url,
+      "Mijn lijst quantity control",
+      (expected) => waitForVisibleListLineQuantity(page, container, expected, line.url),
+    );
+    currentQuantity += 1;
+  }
+}
+
 async function gotoExactProduct(page, url) {
   const exactUrl = assertExactProductUrl(url);
   if (new URL(page.url()).pathname !== new URL(exactUrl).pathname) {
@@ -612,27 +850,57 @@ async function gotoExactProduct(page, url) {
   return exactUrl;
 }
 
-async function readExactProductStates(page, lines) {
+export function normalizeVisibleListRows(rawRows, lines) {
+  const expected = new Map(
+    lines.map((line) => [canonicalProductHref(line.url), line]).filter(([url]) => Boolean(url)),
+  );
+  const observations = new Map();
+  for (const row of rawRows) {
+    const url = canonicalProductHref(row.href);
+    if (!url || !expected.has(url)) continue;
+    const entry = observations.get(url) ?? { quantities: new Set() };
+    for (const value of row.values ?? []) {
+      if (value === null || value === undefined || String(value).trim() === "") continue;
+      const quantity = Number(value);
+      if (Number.isInteger(quantity) && quantity >= 1) entry.quantities.add(quantity);
+    }
+    observations.set(url, entry);
+  }
+
   const rows = [];
-  for (const line of lines) {
-    const url = await gotoExactProduct(page, line.url);
-    const quantity = await readPdpQuantity(page);
-    if (Number.isInteger(quantity) && quantity >= 1) {
-      rows.push({ url, name: line.expected_name, quantity });
-      continue;
+  for (const [url, observation] of observations) {
+    if (observation.quantities.size !== 1) {
+      const detail = observation.quantities.size
+        ? [...observation.quantities].sort((a, b) => a - b).join(", ")
+        : "none";
+      throw new BasketError(`Exact product ${url} has ambiguous Mijn lijst quantities: ${detail}`);
     }
-    const addButton = await findPdpAddButton(page);
-    if (addButton) {
-      if (!(await addButton.isEnabled())) {
-        throw new BasketError(`Exact product ${url} is not currently addable`);
-      }
-      continue;
-    }
-    throw new BasketError(
-      `Exact product ${url} has no scoped add button and no readable product-page quantity; refusing ambiguous cart state`,
-    );
+    const line = expected.get(url);
+    rows.push({ url, name: line.expected_name, quantity: [...observation.quantities][0] });
   }
   return rows;
+}
+
+export async function readVisibleListStates(page, lines) {
+  if (new URL(page.url()).pathname !== "/mijnlijst") {
+    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
+  }
+  await settle(page, { waitForProducts: true });
+  if (await readAccessDenied(page)) throw new BasketError(ACCESS_DENIED_MESSAGE);
+  await assertCookiePopupAbsent(page);
+  const rawRows = await page.locator('a[href*="/producten/product/"]').evaluateAll((links) =>
+    links.map((link) => {
+      const container =
+        link.closest('article, li, [data-testid*="product"], [data-testhook*="product"]') ?? link.parentElement;
+      return {
+        href: link.href,
+        values: [...(container?.querySelectorAll("input") ?? [])]
+          .filter((input) => input.offsetParent !== null)
+          .map((input) => input.value),
+      };
+    }),
+  );
+  return normalizeVisibleListRows(rawRows, lines);
 }
 
 export async function findPdpPlusButton(page) {
@@ -644,12 +912,16 @@ export async function findPdpPlusButton(page) {
       ),
     )) ??
     (await firstVisible(
-      hero.getByRole("button", { name: /^(?:verhoog(?: het)? aantal.*|plus|voeg (?:nog )?één toe|\+)$/i }),
+      hero.getByRole("button", { name: /^(?:verhoog(?: (?:het )?aantal.*)?|plus|voeg (?:nog )?één toe|\+)$/i }),
     ))
   );
 }
 
 async function addExactToVisibleList(page, line) {
+  if (Number.isInteger(line.currentQuantity) && line.currentQuantity >= 1) {
+    await topUpExactOnVisibleList(page, line);
+    return;
+  }
   const url = await gotoExactProduct(page, line.url);
   await assertCookiePopupAbsent(page);
   let currentQuantity = await readPdpQuantity(page);
@@ -664,33 +936,27 @@ async function addExactToVisibleList(page, line) {
     );
   }
   if (!Number.isInteger(currentQuantity) || currentQuantity < 1) {
-    const addButton = await findPdpAddButton(page);
-    if (!addButton) {
+    let initialControl = null;
+    let initialLabel = "scoped add control";
+    if (currentQuantity === 0) {
+      initialControl = await findPdpPlusButton(page);
+      initialLabel = "quantity control";
+    }
+    if (!initialControl) initialControl = await findPdpAddButton(page);
+    if (!initialControl) {
       throw new BasketError(
-        `Exact product ${url} has no scoped add button and no readable quantity; refusing an ambiguous add`,
+        `Exact product ${url} has no scoped add or quantity control and no readable quantity; refusing an ambiguous add`,
       );
     }
-    if (!(await addButton.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
-    try {
-      await addButton.click({ timeout: 12_000 });
-    } catch {
-      throw new BasketError(`The scoped add control for exact product ${url} could not be clicked`);
-    }
-    assertAllowedAutomationUrl(page.url());
-    await waitForPdpQuantity(page, 1, url);
+    if (!(await initialControl.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
+    await clickAndConfirmServerQuantity(page, initialControl, 1, url, initialLabel);
     currentQuantity = 1;
   }
 
   while (currentQuantity < line.quantity) {
     const plus = await findPdpPlusButton(page);
     if (!plus) throw new BasketError(`Quantity control for exact product ${url} could not be read`);
-    try {
-      await plus.click({ timeout: 12_000 });
-    } catch {
-      throw new BasketError(`The quantity control for exact product ${url} could not be clicked`);
-    }
-    assertAllowedAutomationUrl(page.url());
-    await waitForPdpQuantity(page, currentQuantity + 1, url);
+    await clickAndConfirmServerQuantity(page, plus, currentQuantity + 1, url, "quantity control");
     currentQuantity += 1;
   }
 }
@@ -804,13 +1070,19 @@ export async function applyBasketInVisibleBrowser(basket, options = {}) {
   const context = await launchAhProfileContext(options);
   const page = await activePage(context);
   const adapter = {
-    read: () => readExactProductStates(page, plan.lines),
+    read: () => readVisibleListStates(page, plan.lines),
     addExact: (line) => addExactToVisibleList(page, line),
   };
   try {
-    await verifyAuthenticatedMember(page, createMemberRequest(), plan.lines[0].url);
+    await verifyAuthenticatedMember(page, createMemberRequest(), plan.target);
+    const privacy = await ensureNecessaryCookiePreference(page);
     const receipt = await applyBasketWithAdapter(basket, adapter, options);
-    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
+    if (privacy.changed) {
+      receipt.warnings.unshift("AH privacy prompt declined optional cookies; necessary cookies only.");
+    }
+    if (new URL(page.url()).pathname !== "/mijnlijst") {
+      await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
+    }
     await releaseAutomationGuard(context);
     return { context, page, receipt };
   } catch (error) {

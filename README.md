@@ -23,20 +23,28 @@ touches payment.
   screen scraping. No cookies or session values are sent or stored for reads.
 - Browser writes use one dedicated persistent Firefox profile owned by the CLI
   (default `~/.ah-flex/firefox-profile`, override with `AH_FLEX_PROFILE_DIR`,
-  created `0700`). You complete the privacy choice and account login in that
-  visible profile exactly once; the CLI then reuses the same trusted browser
-  for every run. A login in your normal browser or any other profile does not
-  transfer — sessions are bound to the profile that earned them.
+  created `0700`). The CLI reuses that same profile for every run. Authenticate
+  it either through the visible one-time `session login` flow or with the
+  explicit macOS-only `session import-firefox` command below.
 - Password entry, verification codes, and the privacy choice stay outside the
-  CLI. The CLI never reads, exports, or stores cookies or credentials; the
-  profile on disk is the session, and only Firefox reads it.
+  CLI. The optional importer transfers only rows scoped to `ah.be` and its
+  subdomains between two closed local Firefox cookie databases. Cookie names
+  and values remain opaque SQLite data: they are never printed, exported to an
+  intermediary file, included in receipts, tests, or Git, or accepted on the
+  command line. No history, passwords, local storage, preferences, bookmarks,
+  extensions, or unrelated cookies are copied.
 - Cart/list changes are dry-run by default and require an explicit execution
   flag. Checkout and payment automation do not exist. Once exact line/quantity
-  readback succeeds, browser control is released for the human handoff.
-- Preflight and readback use each exact product page's scoped basket controls;
-  the CLI does not infer cart state from recommendation cards. If a later line
-  fails after an earlier click, the CLI prints a partial receipt instead of
-  claiming that nothing changed.
+  readback succeeds, browser control is released for the human handoff. If AH
+  presents its privacy prompt during a confirmed apply, the CLI selects
+  **Weigeren** (necessary cookies only) before the first cart click; it never
+  accepts optional advertising or personalization cookies on the user's behalf.
+- Preflight and readback use the exact product links and quantity inputs rendered
+  in `/mijnlijst`, so one list page proves the whole reviewed basket without a
+  product-page crawl. Existing lines are topped up through their own scoped list
+  control; missing lines still use only the selected product page's scoped
+  control. If a later line fails after an earlier click, the CLI prints a partial
+  receipt instead of claiming that nothing changed or guessing a retry.
 - Prices, promotions, availability, and substitutions remain provisional until
   the final browser review.
 
@@ -78,6 +86,7 @@ ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
 ah-flex session login
 ah-flex session status
+ah-flex session import-firefox "/path/to/firefox/profile" --confirm-ah-cookie-copy [--json]
 ah-flex cart apply basket.json                 # dry-run
 ah-flex cart apply basket.json --confirm-add
 ```
@@ -90,6 +99,18 @@ fallback. Neither transport retries automatically after an Access Denied.
 member query proves the account session is active, then closes the browser.
 `session status` probes the saved profile without changing anything and exits
 non-zero unless the session is authenticated.
+
+On macOS, `session import-firefox` can reuse an AH login from another local
+Firefox profile without ever automating that everyday profile. Quit Firefox
+first so both the source and dedicated CLI profiles are closed, then pass the
+source profile directory and the exact `--confirm-ah-cookie-copy` flag. The
+command uses the system `lsof` and `sqlite3`, requires compatible Firefox cookie
+schemas, copies the schema's ordinary non-ID cookie columns, replaces only
+`ah.be`/`*.ah.be` rows in one transaction, and prints a
+non-sensitive row-count receipt. Run `session status` immediately afterwards;
+the live member query, not the copy receipt, decides whether authentication
+works. The command fails closed instead of copying a whole profile or migrating
+between incompatible Firefox schemas.
 
 During automation, the browser adapter targets bounded pages on
 `https://www.ah.be/` only and fails closed when the site's accessible controls
@@ -109,9 +130,11 @@ continue to login, ordering, or payment.
 4. Run `basket check`, generate the static review, then run `cart apply` without
    the execution flag. Unresolved, unavailable, or stale lines block apply.
 5. After reviewing the exact dry-run, use `--confirm-add`. The CLI proves the
-   saved profile is authenticated, changes the winkelmandje, rereads every
-   exact URL and quantity, and hands the visible browser to the user. An exact
-   line that is already present at the requested quantity is reported
+   saved profile is authenticated, resolves any delayed privacy prompt to
+   necessary cookies only, changes the winkelmandje, waits for AH's own cart
+   response after every click, then rereads every exact URL and quantity from
+   one fresh `/mijnlijst` page before handing the visible browser to the user.
+   An exact line that is already present at the requested quantity is reported
    `already-present` and left untouched; a line present below the requested
    quantity is topped up to exactly the reviewed quantity and reported
    `topped-up`; a line the cart already holds more of is never reduced and is
@@ -133,24 +156,30 @@ had denied both curl and the automated browser profile on `/zoeken`. The
 browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
 denying it, refresh the pinned Chrome version there.
 
-The earlier fresh-profile session modes (guest consent bootstrap and HAR cookie
-transplant) were removed on 2026-08-01 after the live guest write was denied
-before the first click: a brand-new throwaway profile cannot carry the site's
-trust, no matter which cookies are copied into it. The dedicated persistent
-profile replaces them — one human login, then the same returning browser for
-every run.
+The earlier fresh-profile session modes (guest consent bootstrap and HAR replay)
+were removed on 2026-08-01 after the live guest write was denied before the
+first click. The dedicated persistent profile replaces them: it is initialized
+once and then reused as the same returning browser. The optional scoped cookie
+import does not create throwaway profiles and does not claim that copying rows
+alone proves a usable session; `session status` remains the live gate.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
 action.
 
+The authenticated write/readback canary passed on 2026-08-01 with the full
+26-line healthier basket: the CLI found 28 existing packs, topped the reviewed
+Spa line from one to four through three acknowledged browser-issued writes, and
+then proved all 26 exact URLs and all 31 requested packs in one fresh list-page
+readback. No checkout or ordering page was opened.
+
 ## Session boundary
 
-The CLI never replays captured traffic or guesses a GraphQL write, and it never
-imports cookies or credentials from anywhere. The dedicated profile is created
-empty, earns its session from exactly one visible human login, and is reused
-verbatim afterwards. Raw session material never enters output, receipts, tests,
-or Git.
+The CLI never replays captured traffic or guesses a GraphQL write. The dedicated
+profile is created empty and reused afterwards. It can earn its session in the
+visible login flow or receive only the compatible AH-domain cookie rows through
+the explicit local import command. Raw session material never enters output,
+receipts, tests, intermediary files, command arguments, or Git.
 
 The implementation is custom. Public grocery MCPs informed the generic safety
 shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or

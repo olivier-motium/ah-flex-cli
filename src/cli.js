@@ -20,6 +20,7 @@ import {
   runInteractiveLogin,
   sessionStatus,
 } from "./browser.js";
+import { importFirefoxAhCookies } from "./firefox-session.js";
 import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
 
@@ -36,15 +37,16 @@ Usage:
   ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
   ah-flex session status [--json]
+  ah-flex session import-firefox <source-profile-dir> --confirm-ah-cookie-copy [--json]
   ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Browser writes use a
-  single dedicated persistent Firefox profile: run 'ah-flex session login' once,
-  complete the privacy choice and account login in the visible window, and every
-  later run reuses that trusted session. A login in any other browser or profile
-  does not transfer; the dedicated profile needs its own one-time login. The
-  live member query must prove the authenticated account before any cart click.
+  single dedicated persistent Firefox profile. Authenticate it with 'session
+  login', or optionally copy only AH Belgium cookie rows from a closed Firefox
+  profile with the macOS-only 'session import-firefox'. Every later run reuses
+  that session. The live member query must prove the authenticated account
+  before any cart click.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
   session); --transport browser reads through the same trusted profile.
   Checkout, ordering, payment, substitutions, and implicit product selection do
@@ -174,6 +176,26 @@ async function handleSearch(args) {
 
 async function handleSession(args) {
   const action = args.shift();
+  if (action === "import-firefox") {
+    const sourceProfileDir = args.shift();
+    const confirmed = takeFlag(args, "--confirm-ah-cookie-copy");
+    const asJson = takeFlag(args, "--json");
+    rejectUnknown(args);
+    if (!confirmed) {
+      throw new BasketError("session import-firefox requires the exact --confirm-ah-cookie-copy flag");
+    }
+    if (!sourceProfileDir) {
+      throw new BasketError("session import-firefox requires a source Firefox profile directory");
+    }
+    const receipt = await importFirefoxAhCookies(sourceProfileDir);
+    if (asJson) {
+      console.log(JSON.stringify(receipt, null, 2));
+    } else {
+      console.log(`Imported ${receipt.imported_cookie_rows} AH Belgium cookie row(s) into the dedicated CLI profile.`);
+      console.log("No cookie names or values were printed. Run 'ah-flex session status' to prove authentication.");
+    }
+    return;
+  }
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   if (action === "status") {
@@ -195,7 +217,7 @@ async function handleSession(args) {
     if (status.state !== "authenticated") process.exitCode = 1;
     return;
   }
-  if (action !== "login") throw new BasketError("Use 'session login' or 'session status'");
+  if (action !== "login") throw new BasketError("Use 'session login', 'session status', or 'session import-firefox'");
   if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
   console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
   console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
