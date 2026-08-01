@@ -3,7 +3,43 @@ import path from "node:path";
 import { chmod, mkdir } from "node:fs/promises";
 import { firefox } from "playwright-core";
 import { assertActionableBasket, assertExactProductUrl, BasketError, calculateUnitPrice } from "./basket.js";
+import {
+  BASKET_ITEMS_ADD_OPERATION,
+  BASKET_ITEMS_UPDATE_OPERATION,
+  assertBasketHttpStatus,
+  basketCollectionItems,
+  buildBasketMutationPlan,
+  createBasketItemsAddRequest,
+  createBasketItemsUpdateRequest,
+  createBasketQueryRequest,
+  normalizeBasketGraphqlResponse,
+  normalizeRequestedLines,
+  parseProductIdFromUrl,
+  reconcileTopUpCandidates,
+  validateBasketMutationResponse,
+} from "./basket-graphql.js";
 import { createMemberRequestBody } from "./member-query.js";
+
+export {
+  BASKET_COLLECTIONS,
+  BASKET_ITEMS_ADD_MUTATION,
+  BASKET_ITEMS_ADD_OPERATION,
+  BASKET_ITEMS_UPDATE_MUTATION,
+  BASKET_ITEMS_UPDATE_OPERATION,
+  BASKET_QUERY,
+  BASKET_QUERY_OPERATION,
+  basketCollectionItems,
+  buildBasketMutationPlan,
+  createBasketItemsAddRequest,
+  createBasketItemsUpdateRequest,
+  createBasketQueryRequest,
+  normalizeBasketCollections,
+  normalizeBasketGraphqlResponse,
+  normalizeRequestedLines,
+  parseProductIdFromUrl,
+  reconcileTopUpCandidates,
+  validateBasketMutationResponse,
+} from "./basket-graphql.js";
 
 const AH_ORIGIN = "https://www.ah.be";
 const BLOCKED_PATH = /\/(?:checkout|afrekenen|bestellen|betaling|payment|order)(?:\/|$)/i;
@@ -11,6 +47,8 @@ const ALLOWED_PATH = /^(?:\/$|\/zoeken(?:\/|$)|\/producten\/product\/|\/mijnlijs
 const DEFAULT_PROFILE_DIR = path.join(".ah-flex", "firefox-profile");
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_POLL_MS = 2_000;
+const BASKET_GRAPHQL_TIMEOUT_MS = 15_000;
+const BASKET_GRAPHQL_MAX_BYTES = 512 * 1024;
 
 const navigationGuards = new WeakMap();
 
@@ -196,32 +234,56 @@ export function buildApplyPlan(basket, options = {}) {
 }
 
 function indexSnapshot(rows) {
+  if (!Array.isArray(rows)) throw new BasketError("AH basket readback was malformed");
   const result = new Map();
   for (const row of rows) {
     const url = canonicalProductHref(row.url);
     if (!url) continue;
+    if (!Number.isInteger(row.quantity) || row.quantity < 1) {
+      throw new BasketError(`Exact product ${url} has an unreadable basket quantity`);
+    }
     if (result.has(url)) {
       throw new BasketError(`Ambiguous duplicate observations for exact product ${url}`);
     }
-    result.set(url, { ...row, url, quantity: row.quantity ?? null, name: row.name || "" });
+    result.set(url, { ...row, url, name: row.name || "" });
   }
   return result;
 }
 
+function readbackMismatches(lines, expectedFinal, rows, label) {
+  const observedRows = indexSnapshot(rows);
+  const mismatches = [];
+  for (const line of lines) {
+    const expected = expectedFinal.get(line.url) ?? line.quantity;
+    const observed = observedRows.get(line.url);
+    if (!observed) {
+      mismatches.push(`${line.url}: exact product missing from ${label}`);
+    } else if (observed.quantity !== expected) {
+      mismatches.push(`${line.url}: expected quantity ${expected}, observed ${observed.quantity}`);
+    }
+  }
+  return mismatches;
+}
+
 export async function applyBasketWithAdapter(basket, adapter, options = {}) {
   const plan = buildApplyPlan(basket, options);
-  if (!adapter || typeof adapter.read !== "function" || typeof adapter.addExact !== "function") {
-    throw new TypeError("Adapter must provide read() and addExact() methods");
+  const requested = normalizeRequestedLines(plan.lines);
+  if (!adapter || typeof adapter.read !== "function" || typeof adapter.applyExactBatch !== "function") {
+    throw new TypeError("Adapter must provide read() and applyExactBatch() methods");
   }
 
   let beforeRows = [];
   let afterRows = [];
+  let before = new Map();
+  const requestedById = new Map(requested.map((line) => [line.id, line]));
+  const dispatchedIds = new Set();
   const actions = [];
   try {
     beforeRows = await adapter.read();
-    const before = indexSnapshot(beforeRows);
+    before = indexSnapshot(beforeRows);
     const expectedFinal = new Map();
     const warnings = [];
+    const changes = [];
     for (const line of plan.lines) {
       const existing = before.get(line.url);
       if (existing) {
@@ -239,37 +301,78 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
           continue;
         }
       }
-      const action = { ...line, action: "attempted", ...(existing ? { from_quantity: existing.quantity ?? null } : {}) };
+      const action = { ...line, action: "pending", ...(existing ? { from_quantity: existing.quantity ?? null } : {}) };
       actions.push(action);
-      await adapter.addExact({
+      changes.push({
         url: line.url,
         quantity: line.quantity,
         expectedName: line.expected_name,
         currentQuantity: existing?.quantity ?? 0,
       });
-      action.action = existing ? "topped-up" : "added";
       expectedFinal.set(line.url, line.quantity);
     }
 
-    afterRows = await adapter.read();
-    const after = indexSnapshot(afterRows);
-    const mismatches = [];
-    for (const line of plan.lines) {
-      const expected = expectedFinal.get(line.url) ?? line.quantity;
-      const observed = after.get(line.url);
-      if (!observed) {
-        mismatches.push(`${line.url}: exact product missing after apply`);
-      } else if (observed.quantity !== expected) {
-        mismatches.push(
-          `${line.url}: expected quantity ${expected}, observed ${observed.quantity ?? "unreadable"}`,
+    if (changes.length) {
+      const changeIds = new Set(changes.map((line) => parseProductIdFromUrl(line.url)));
+      const batchResult = await adapter.applyExactBatch(changes, (items, operation) => {
+        if (operation !== BASKET_ITEMS_ADD_OPERATION && operation !== BASKET_ITEMS_UPDATE_OPERATION) {
+          throw new BasketError("Basket adapter reported an unknown mutation; no request was dispatched");
+        }
+        if (!Array.isArray(items) || items.length === 0) {
+          throw new BasketError("Basket adapter reported an empty mutation; no request was dispatched");
+        }
+        const ids = items.map((item) =>
+          Number.isSafeInteger(item?.id) ? item.id : parseProductIdFromUrl(item?.url),
         );
+        if (ids.some((id) => !changeIds.has(id) || !requestedById.has(id))) {
+          throw new BasketError("Basket adapter reported an unreviewed mutation; no request was dispatched");
+        }
+        for (const id of ids) dispatchedIds.add(id);
+      });
+      const outcomes = new Map(
+        (batchResult?.outcomes ?? [])
+          .map((outcome) => [canonicalProductHref(outcome.url), outcome])
+          .filter(([url]) => Boolean(url)),
+      );
+      for (const action of actions) {
+        if (action.action !== "pending") continue;
+        const outcome = outcomes.get(action.url);
+        action.action =
+          outcome?.action ??
+          (Object.prototype.hasOwnProperty.call(action, "from_quantity") ? "topped-up" : "added");
+        if (Number.isInteger(outcome?.observed_quantity)) {
+          action.observed_quantity = outcome.observed_quantity;
+        }
+        if (action.action === "kept-higher" && Number.isInteger(action.observed_quantity)) {
+          expectedFinal.set(action.url, action.observed_quantity);
+        }
       }
     }
+
+    afterRows = await adapter.read();
+    const mismatches = readbackMismatches(plan.lines, expectedFinal, afterRows, "fresh GraphQL basket readback");
     if (mismatches.length) {
       throw new BasketError(
-        `Visible-cart readback failed after ${actions.filter((action) => action.action === "added" || action.action === "topped-up").length} cart change(s)`,
+        `Fresh basket readback failed after ${actions.filter((action) => action.action === "added" || action.action === "topped-up").length} cart change(s)`,
         mismatches.map((message) => ({ level: "error", code: "READBACK_MISMATCH", path: "browser", message })),
       );
+    }
+
+    let visibleAfter = null;
+    if (typeof adapter.readVisible === "function") {
+      visibleAfter = await adapter.readVisible();
+      const visibleMismatches = readbackMismatches(plan.lines, expectedFinal, visibleAfter, "reloaded visible Mijn lijst");
+      if (visibleMismatches.length) {
+        throw new BasketError(
+          "Reloaded visible Mijn lijst did not match the verified GraphQL basket",
+          visibleMismatches.map((message) => ({
+            level: "error",
+            code: "VISIBLE_READBACK_MISMATCH",
+            path: "browser",
+            message,
+          })),
+        );
+      }
     }
 
     return {
@@ -277,18 +380,41 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
       actions,
       before: [...before.values()],
       after: afterRows,
+      ...(visibleAfter ? { visible_after: visibleAfter } : {}),
       warnings: [...warnings, "Current prices are visible for human review but are not a hard DOM readback predicate."],
     };
   } catch (cause) {
     const error =
       cause instanceof BasketError ? cause : new BasketError(cause instanceof Error ? cause.message : String(cause));
-    error.partialReceipt = {
-      complete: false,
-      target: plan.target,
-      actions,
-      observed: afterRows,
-    };
-    if (actions.some((action) => action.action === "attempted" || action.action === "added")) {
+    if (dispatchedIds.size) {
+      try {
+        afterRows = await adapter.read();
+      } catch {
+        // A mutation was dispatched, but a safe readback is unavailable. Keep every attempted line uncertain.
+      }
+      const observed = indexSnapshot(afterRows);
+      for (const action of actions) {
+        if (action.action !== "pending") continue;
+        const id = parseProductIdFromUrl(action.url);
+        if (!dispatchedIds.has(id)) {
+          action.action = "not-attempted";
+          continue;
+        }
+        action.action = "attempted";
+        const row = observed.get(action.url);
+        if (row?.quantity === action.quantity) {
+          action.action = Object.prototype.hasOwnProperty.call(action, "from_quantity") ? "topped-up" : "added";
+        } else if (row && row.quantity > action.quantity) {
+          action.action = "kept-higher";
+          action.observed_quantity = row.quantity;
+        }
+      }
+      error.partialReceipt = {
+        complete: false,
+        target: plan.target,
+        actions,
+        observed: afterRows,
+      };
       error.diagnostics = [
         ...(error.diagnostics ?? []),
         {
@@ -431,6 +557,162 @@ export async function verifyAuthenticatedMember(page, memberRequest, targetUrl) 
   }
 }
 
+function assertMijnlijstPage(page) {
+  let current;
+  try {
+    current = new URL(page.url());
+  } catch {
+    throw new BasketError("The authenticated Mijn lijst page is not open; refusing a basket request");
+  }
+  if (current.origin !== AH_ORIGIN || current.pathname !== "/mijnlijst") {
+    throw new BasketError("Basket GraphQL is permitted only from the authenticated AH Belgium Mijn lijst page");
+  }
+}
+
+async function executeBasketGraphql(page, request, expectedMutation = null, onDispatch = null) {
+  assertMijnlijstPage(page);
+  if (expectedMutation && typeof onDispatch === "function") onDispatch();
+  let result;
+  try {
+    result = await page.evaluate(
+      async ({ headers, body, timeoutMs, maxBytes }) => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch("/gql", {
+            method: "POST",
+            credentials: "include",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+          const text = await response.text();
+          if (new TextEncoder().encode(text).byteLength > maxBytes) {
+            return { status: response.status, tooLarge: true, json: null };
+          }
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            // A non-JSON body cannot acknowledge or prove basket state.
+          }
+          return { status: response.status, tooLarge: false, json };
+        } finally {
+          clearTimeout(timeout);
+        }
+      },
+      {
+        headers: request.headers,
+        body: request.body,
+        timeoutMs: BASKET_GRAPHQL_TIMEOUT_MS,
+        maxBytes: BASKET_GRAPHQL_MAX_BYTES,
+      },
+    );
+  } catch {
+    throw new BasketError("AH basket GraphQL request did not complete; cart state is unverified");
+  }
+  assertBasketHttpStatus(result?.status);
+  if (result.tooLarge || !result.json) {
+    throw new BasketError("AH basket GraphQL response was not bounded JSON; cart state is unverified");
+  }
+  return expectedMutation
+    ? validateBasketMutationResponse(result.json, expectedMutation)
+    : normalizeBasketGraphqlResponse(result.json);
+}
+
+export async function readBasketGql(page) {
+  return executeBasketGraphql(page, createBasketQueryRequest());
+}
+
+async function addBasketItemsGql(page, items, onDispatch) {
+  const request = createBasketItemsAddRequest(items);
+  return executeBasketGraphql(page, request, BASKET_ITEMS_ADD_OPERATION, () =>
+    onDispatch(items, BASKET_ITEMS_ADD_OPERATION),
+  );
+}
+
+async function updateBasketItemsGql(page, items, onDispatch) {
+  const request = createBasketItemsUpdateRequest(items);
+  return executeBasketGraphql(page, request, BASKET_ITEMS_UPDATE_OPERATION, () =>
+    onDispatch(items, BASKET_ITEMS_UPDATE_OPERATION),
+  );
+}
+
+function snapshotRows(snapshot, lines) {
+  const requested = normalizeRequestedLines(lines);
+  const observed = new Map(basketCollectionItems(snapshot).map((item) => [item.id, item.quantity]));
+  return requested
+    .filter((line) => observed.has(line.id))
+    .map((line) => ({ url: line.url, name: line.expected_name, quantity: observed.get(line.id) }));
+}
+
+function assertSameChangeSet(changes, mutationPlan) {
+  const requestedIds = new Set(normalizeRequestedLines(changes).map((line) => line.id));
+  const plannedIds = new Set([
+    ...mutationPlan.addItems.map((item) => item.id),
+    ...mutationPlan.topUpCandidates.map((item) => item.id),
+  ]);
+  if (
+    requestedIds.size !== plannedIds.size ||
+    [...requestedIds].some((id) => !plannedIds.has(id))
+  ) {
+    throw new BasketError("Basket changed between preflight and the batch plan; no mutation was dispatched");
+  }
+}
+
+export function createBasketGraphqlAdapter(page, lines) {
+  const requested = normalizeRequestedLines(lines);
+  let snapshot = null;
+  return {
+    async read() {
+      snapshot = await readBasketGql(page);
+      return snapshotRows(snapshot, requested);
+    },
+    async applyExactBatch(changes, onDispatch) {
+      if (!snapshot) throw new BasketError("Basket batch was requested without a fresh preflight read");
+      const initialPlan = buildBasketMutationPlan(requested, snapshot);
+      assertSameChangeSet(changes, initialPlan);
+      let outcomes = initialPlan.lines.map((line) => ({ ...line }));
+
+      if (initialPlan.addItems.length) {
+        await addBasketItemsGql(page, initialPlan.addItems, onDispatch);
+        snapshot = await readBasketGql(page);
+        const afterAdd = new Map(basketCollectionItems(snapshot).map((item) => [item.id, item.quantity]));
+        for (const item of initialPlan.addItems) {
+          const observed = afterAdd.get(item.id);
+          if (!Number.isInteger(observed) || observed < item.quantity) {
+            throw new BasketError("AH did not expose every added exact item in the fresh basket readback");
+          }
+          const outcome = outcomes.find((line) => line.id === item.id);
+          outcome.action = observed === item.quantity ? "added" : "kept-higher";
+          outcome.observed_quantity = observed;
+        }
+      } else if (initialPlan.topUpCandidates.length) {
+        // A top-up-only run still rereads immediately before dispatch and
+        // aborts when it can observe concurrent quantity drift.
+        snapshot = await readBasketGql(page);
+      }
+
+      const reconciled = reconcileTopUpCandidates({ ...initialPlan, lines: outcomes }, snapshot);
+      outcomes = reconciled.lines;
+      if (reconciled.updateItems.length) {
+        await updateBasketItemsGql(page, reconciled.updateItems, onDispatch);
+        const updatedIds = new Set(reconciled.updateItems.map((item) => item.id));
+        outcomes = outcomes.map((line) =>
+          updatedIds.has(line.id) ? { ...line, action: "topped-up", observed_quantity: line.quantity } : line,
+        );
+      }
+      return { outcomes };
+    },
+    async readVisible() {
+      assertMijnlijstPage(page);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      assertAllowedAutomationUrl(page.url());
+      return readVisibleListStates(page, requested);
+    },
+  };
+}
+
 async function settle(page, options = {}) {
   await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
   if (options.waitForProducts) {
@@ -502,7 +784,7 @@ export async function assertCookiePopupAbsent(page) {
   const popup = page.locator('[data-testid="cookie-popup"]');
   if (await popup.isVisible().catch(() => false)) {
     throw new BasketError(
-      "The AH privacy choice reappeared in the trusted profile; run 'ah-flex session login' and redo it there. No cart click was attempted",
+      "The AH privacy choice reappeared in the trusted profile; run 'ah-flex session login' and redo it there. No basket mutation was attempted",
     );
   }
 }
@@ -520,7 +802,7 @@ export async function ensureNecessaryCookiePreference(page, options = {}) {
     (await firstVisible(popup.getByRole("button", { name: /^weigeren$/i })));
   if (!decline || !(await decline.isEnabled())) {
     throw new BasketError(
-      "The AH privacy prompt appeared without its necessary-cookies-only choice; no cart click was attempted",
+      "The AH privacy prompt appeared without its necessary-cookies-only choice; no basket mutation was attempted",
     );
   }
   try {
@@ -528,326 +810,10 @@ export async function ensureNecessaryCookiePreference(page, options = {}) {
     await popup.waitFor({ state: "hidden", timeout: 12_000 });
   } catch {
     throw new BasketError(
-      "The AH privacy prompt could not be set to necessary cookies only; no cart click was attempted",
+      "The AH privacy prompt could not be set to necessary cookies only; no basket mutation was attempted",
     );
   }
   return { changed: true, choice: "necessary-only" };
-}
-
-const PDP_HERO_ACTIONS =
-  '[data-testid^="pdp-hero-basket-actions"], [data-testhook^="pdp-hero-basket-actions"]';
-
-export async function findPdpAddButton(page) {
-  const exact = await firstVisible(
-    page.locator(
-      '[data-testid="pdp-hero-basket-actions-add-to-cart-button"], [data-testhook="pdp-hero-basket-actions-add-to-cart-button"]',
-    ),
-  );
-  if (exact) return exact;
-  return firstVisible(
-    page
-      .locator(PDP_HERO_ACTIONS)
-      .getByRole("button", { name: /^voeg toe(?: aan (?:je )?(?:winkelmand|boodschappenlijst|lijst))?$/i }),
-  );
-}
-
-export function extractPdpQuantity(controls) {
-  const observed = new Set();
-  for (const control of controls) {
-    const tag = String(control.tagName ?? "").toLowerCase();
-    const testId = String(control.testId ?? "");
-    const aria = String(control.aria ?? "");
-    const roleText = `${tag} ${testId} ${aria}`.toLowerCase();
-    const isAction =
-      tag === "button" ||
-      /increase|decrease|increment|decrement|plus|minus|add|remove|verhoog|verlaag/.test(roleText);
-    const isInput = tag === "input";
-    const isCurrentDisplay = !isAction && /quantity|aantal/.test(roleText);
-    if (!isInput && !isCurrentDisplay) continue;
-
-    const candidates = isInput
-      ? [control.value]
-      : [String(control.text ?? "").match(/^\s*(\d+)\s*$/)?.[1], aria.match(/(?:huidig|aantal)\D*(\d+)/i)?.[1]];
-    for (const candidate of candidates) {
-      if (candidate === null || candidate === undefined || String(candidate).trim() === "") continue;
-      const quantity = Number(candidate);
-      if (Number.isInteger(quantity) && quantity >= 0) observed.add(quantity);
-    }
-  }
-  if (observed.size > 1) {
-    throw new BasketError(`Ambiguous product-page quantity controls: ${[...observed].join(", ")}`);
-  }
-  return observed.size === 1 ? [...observed][0] : null;
-}
-
-async function readPdpQuantity(page) {
-  const controls = page.locator(
-    [
-      '[data-testid^="pdp-hero-basket-actions"] input',
-      '[data-testid^="pdp-hero-basket-actions"] [data-testid*="quantity"]',
-      '[data-testid^="pdp-hero-basket-actions"][data-testid*="quantity"]',
-      '[data-testid^="pdp-hero-basket-actions"] [aria-label*="aantal" i]',
-      '[data-testhook^="pdp-hero-basket-actions"] input',
-      '[data-testhook^="pdp-hero-basket-actions"] [data-testid*="quantity"]',
-    ].join(", "),
-  );
-  const rawControls = [];
-  for (let index = 0; index < (await controls.count()); index += 1) {
-    const control = controls.nth(index);
-    if (!(await control.isVisible())) continue;
-    rawControls.push({
-      tagName: await control.evaluate((node) => node.tagName),
-      testId: (await control.getAttribute("data-testid")) ?? "",
-      aria: (await control.getAttribute("aria-label")) ?? "",
-      text: await control.innerText().catch(() => ""),
-      value: await control.inputValue().catch(() => null),
-    });
-  }
-  return extractPdpQuantity(rawControls);
-}
-
-async function waitForPdpQuantity(page, expected, url) {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    let observed = null;
-    try {
-      observed = await readPdpQuantity(page);
-    } catch {
-      // Transient duplicate controls can exist while the basket widget rerenders.
-    }
-    if (observed === expected) return;
-    if (Number.isInteger(observed) && observed > expected) {
-      throw new BasketError(`Exact product ${url} advanced past quantity ${expected} to ${observed}`);
-    }
-    if (attempt < 79) await page.waitForTimeout(100);
-  }
-  throw new BasketError(`Exact product ${url} did not reach visible quantity ${expected}`);
-}
-
-export function isAhCartWriteResponse(response) {
-  try {
-    const request = response.request();
-    const url = new URL(response.url());
-    return request.method() === "POST" && url.origin === AH_ORIGIN && url.pathname === "/gql";
-  } catch {
-    return false;
-  }
-}
-
-export function readGraphqlOperationNames(response) {
-  try {
-    const body = response.request().postDataJSON();
-    const operations = Array.isArray(body) ? body : [body];
-    return operations
-      .map((entry) => entry?.operationName)
-      .filter((name) => typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(name));
-  } catch {
-    return [];
-  }
-}
-
-export async function inspectBasketUpdateResponse(response) {
-  try {
-    const payload = await response.json();
-    const entries = Array.isArray(payload) ? payload : [payload];
-    const errorCodes = new Set();
-    let hasBasketUpdate = false;
-    let resultObject = false;
-    let errorCount = 0;
-    for (const entry of entries) {
-      const data = entry?.data;
-      if (data && typeof data === "object" && !Array.isArray(data) && "basketItemsUpdate" in data) {
-        hasBasketUpdate = true;
-        const result = data.basketItemsUpdate?.result;
-        if (result && typeof result === "object" && !Array.isArray(result)) resultObject = true;
-      }
-      if (Array.isArray(entry?.errors)) {
-        errorCount += entry.errors.length;
-        for (const error of entry.errors) {
-          const code = error?.extensions?.code;
-          if (typeof code === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(code)) errorCodes.add(code);
-        }
-      }
-    }
-    return {
-      hasBasketUpdate,
-      resultObject,
-      errorCount,
-      errorCodes: [...errorCodes].sort(),
-    };
-  } catch {
-    return { hasBasketUpdate: false, resultObject: false, errorCount: 0, errorCodes: [] };
-  }
-}
-
-function formatGraphqlSummary(summary) {
-  const codes = summary.errorCodes.join(", ") || (summary.errorCount ? "unclassified" : "none");
-  return `basket update ${summary.hasBasketUpdate ? "present" : "missing"}; result ${summary.resultObject ? "object" : "missing"}; ${summary.errorCount} error(s); codes ${codes}`;
-}
-
-export async function isAhBasketUpdateResponse(response) {
-  if (!isAhCartWriteResponse(response)) return false;
-  return (await inspectBasketUpdateResponse(response)).hasBasketUpdate;
-}
-
-async function clickAndConfirmServerQuantity(
-  page,
-  control,
-  expected,
-  url,
-  label,
-  waitForQuantity = (quantity) => waitForPdpQuantity(page, quantity, url),
-) {
-  const observedOperations = new Set();
-  const observeResponse = (response) => {
-    if (!isAhCartWriteResponse(response)) return;
-    for (const name of readGraphqlOperationNames(response)) observedOperations.add(name);
-  };
-  page.on("response", observeResponse);
-  const responsePromise = page
-    .waitForResponse(isAhBasketUpdateResponse, { timeout: 15_000 })
-    .catch(() => null);
-  try {
-    try {
-      await control.click({ timeout: 12_000 });
-    } catch {
-      throw new BasketError(`The ${label} for exact product ${url} could not be clicked`);
-    }
-    const response = await responsePromise;
-    if (!response || !response.ok()) {
-      throw new BasketError(
-        `AH did not acknowledge the ${label} for exact product ${url}; its cart state remains unverified`,
-      );
-    }
-    const responseSummary = await inspectBasketUpdateResponse(response);
-    if (responseSummary.errorCount || !responseSummary.resultObject) {
-      throw new BasketError(
-        `AH rejected the ${label} for exact product ${url}; ${formatGraphqlSummary(responseSummary)}`,
-      );
-    }
-    try {
-      await waitForQuantity(expected);
-    } catch {
-      const operations = [...observedOperations].sort().join(", ") || "none";
-      throw new BasketError(
-        `Exact product ${url} did not reach visible quantity ${expected}; ${formatGraphqlSummary(responseSummary)}; observed AH GraphQL operations: ${operations}`,
-      );
-    }
-    assertAllowedAutomationUrl(page.url());
-    await assertCookiePopupAbsent(page);
-  } finally {
-    page.off("response", observeResponse);
-  }
-}
-
-async function readVisibleListLineQuantity(container, url) {
-  const inputs = container.locator("input");
-  const observed = new Set();
-  for (let index = 0; index < (await inputs.count()); index += 1) {
-    const input = inputs.nth(index);
-    if (!(await input.isVisible())) continue;
-    const value = await input.inputValue().catch(() => null);
-    if (value === null || String(value).trim() === "") continue;
-    const quantity = Number(value);
-    if (Number.isInteger(quantity) && quantity >= 1) observed.add(quantity);
-  }
-  if (observed.size !== 1) {
-    const detail = observed.size ? [...observed].sort((a, b) => a - b).join(", ") : "none";
-    throw new BasketError(`Exact product ${url} has ambiguous Mijn lijst quantities: ${detail}`);
-  }
-  return [...observed][0];
-}
-
-async function waitForVisibleListLineQuantity(page, container, expected, url) {
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    let observed = null;
-    try {
-      observed = await readVisibleListLineQuantity(container, url);
-    } catch {
-      // The list card can briefly replace its quantity widget after a write.
-    }
-    if (observed === expected) return;
-    if (Number.isInteger(observed) && observed > expected) {
-      throw new BasketError(`Exact product ${url} advanced past quantity ${expected} to ${observed}`);
-    }
-    if (attempt < 79) await page.waitForTimeout(100);
-  }
-  throw new BasketError(`Exact product ${url} did not reach visible quantity ${expected}`);
-}
-
-async function findVisibleListLine(page, url) {
-  const productId = new URL(assertExactProductUrl(url)).pathname.match(/\/(wi\d+)(?:\/|$)/)?.[1];
-  const links = page.locator(`a[href*="/producten/product/${productId}/"]`);
-  for (let index = 0; index < (await links.count()); index += 1) {
-    const link = links.nth(index);
-    if (!(await link.isVisible())) continue;
-    if (canonicalProductHref(await link.getAttribute("href")) !== canonicalProductHref(url)) continue;
-    const container = link.locator(
-      'xpath=ancestor::*[self::article or self::li or contains(@data-testid, "product") or contains(@data-testhook, "product")][1]',
-    );
-    if ((await container.count()) && (await container.first().isVisible())) return container.first();
-  }
-  return null;
-}
-
-export async function findVisibleListPlusButton(container) {
-  return (
-    (await firstVisible(
-      container.locator(
-        '[data-testid*="quantity-stepper-increase"], [data-testhook*="quantity-stepper-increase"], [data-testid*="increase"], [data-testhook*="increase"]',
-      ),
-    )) ??
-    (await firstVisible(
-      container.getByRole("button", { name: /^(?:verhoog(?: (?:het )?aantal.*)?|plus|\+)$/i }),
-    ))
-  );
-}
-
-async function topUpExactOnVisibleList(page, line) {
-  if (new URL(page.url()).pathname !== "/mijnlijst") {
-    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
-    await settle(page, { waitForProducts: true });
-  }
-  if (await readAccessDenied(page)) throw new BasketError(ACCESS_DENIED_MESSAGE);
-  await assertCookiePopupAbsent(page);
-  const container = await findVisibleListLine(page, line.url);
-  if (!container) {
-    throw new BasketError(`Exact product ${line.url} disappeared from Mijn lijst before its top-up`);
-  }
-  let currentQuantity = await readVisibleListLineQuantity(container, line.url);
-  if (currentQuantity !== line.currentQuantity) {
-    throw new BasketError(
-      `Exact product ${line.url} changed from preflight quantity ${line.currentQuantity} to ${currentQuantity}; refusing a stale top-up`,
-    );
-  }
-  while (currentQuantity < line.quantity) {
-    const plus = await findVisibleListPlusButton(container);
-    if (!plus || !(await plus.isEnabled())) {
-      throw new BasketError(`Quantity control for exact product ${line.url} could not be used on Mijn lijst`);
-    }
-    await clickAndConfirmServerQuantity(
-      page,
-      plus,
-      currentQuantity + 1,
-      line.url,
-      "Mijn lijst quantity control",
-      (expected) => waitForVisibleListLineQuantity(page, container, expected, line.url),
-    );
-    currentQuantity += 1;
-  }
-}
-
-async function gotoExactProduct(page, url) {
-  const exactUrl = assertExactProductUrl(url);
-  if (new URL(page.url()).pathname !== new URL(exactUrl).pathname) {
-    await safeGoto(page, exactUrl);
-  }
-  if (new URL(page.url()).pathname !== new URL(exactUrl).pathname) {
-    throw new BasketError(`Exact product navigation drifted from ${exactUrl} to ${page.url()}`);
-  }
-  if (await readAccessDenied(page)) {
-    throw new BasketError(ACCESS_DENIED_MESSAGE);
-  }
-  return exactUrl;
 }
 
 export function normalizeVisibleListRows(rawRows, lines) {
@@ -901,64 +867,6 @@ export async function readVisibleListStates(page, lines) {
     }),
   );
   return normalizeVisibleListRows(rawRows, lines);
-}
-
-export async function findPdpPlusButton(page) {
-  const hero = page.locator(PDP_HERO_ACTIONS);
-  return (
-    (await firstVisible(
-      page.locator(
-        '[data-testid^="pdp-hero-basket-actions"][data-testid*="increase"], [data-testid^="pdp-hero-basket-actions"][data-testid*="plus"], [data-testhook^="pdp-hero-basket-actions"][data-testhook*="increase"], [data-testhook^="pdp-hero-basket-actions"][data-testhook*="plus"]',
-      ),
-    )) ??
-    (await firstVisible(
-      hero.getByRole("button", { name: /^(?:verhoog(?: (?:het )?aantal.*)?|plus|voeg (?:nog )?één toe|\+)$/i }),
-    ))
-  );
-}
-
-async function addExactToVisibleList(page, line) {
-  if (Number.isInteger(line.currentQuantity) && line.currentQuantity >= 1) {
-    await topUpExactOnVisibleList(page, line);
-    return;
-  }
-  const url = await gotoExactProduct(page, line.url);
-  await assertCookiePopupAbsent(page);
-  let currentQuantity = await readPdpQuantity(page);
-  if (Number.isInteger(currentQuantity) && currentQuantity > line.quantity) {
-    throw new BasketError(
-      `Exact product ${url} is already at quantity ${currentQuantity}, above the requested ${line.quantity}; refusing to reduce`,
-    );
-  }
-  if (currentQuantity === line.quantity) {
-    throw new BasketError(
-      `Exact product ${url} is already at the requested quantity ${line.quantity}; refusing a duplicate add`,
-    );
-  }
-  if (!Number.isInteger(currentQuantity) || currentQuantity < 1) {
-    let initialControl = null;
-    let initialLabel = "scoped add control";
-    if (currentQuantity === 0) {
-      initialControl = await findPdpPlusButton(page);
-      initialLabel = "quantity control";
-    }
-    if (!initialControl) initialControl = await findPdpAddButton(page);
-    if (!initialControl) {
-      throw new BasketError(
-        `Exact product ${url} has no scoped add or quantity control and no readable quantity; refusing an ambiguous add`,
-      );
-    }
-    if (!(await initialControl.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
-    await clickAndConfirmServerQuantity(page, initialControl, 1, url, initialLabel);
-    currentQuantity = 1;
-  }
-
-  while (currentQuantity < line.quantity) {
-    const plus = await findPdpPlusButton(page);
-    if (!plus) throw new BasketError(`Quantity control for exact product ${url} could not be read`);
-    await clickAndConfirmServerQuantity(page, plus, currentQuantity + 1, url, "quantity control");
-    currentQuantity += 1;
-  }
 }
 
 async function ensureAhOriginPage(page) {
@@ -1069,10 +977,7 @@ export async function applyBasketInVisibleBrowser(basket, options = {}) {
   const plan = buildApplyPlan(basket, options);
   const context = await launchAhProfileContext(options);
   const page = await activePage(context);
-  const adapter = {
-    read: () => readVisibleListStates(page, plan.lines),
-    addExact: (line) => addExactToVisibleList(page, line),
-  };
+  const adapter = createBasketGraphqlAdapter(page, plan.lines);
   try {
     await verifyAuthenticatedMember(page, createMemberRequest(), plan.target);
     const privacy = await ensureNecessaryCookiePreference(page);

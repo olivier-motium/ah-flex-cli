@@ -13,9 +13,11 @@ touches payment.
 ## Boundaries
 
 - This is a custom personal-use browser helper, not an official AH integration.
-- It does not guess or call an undocumented cart mutation API. One pinned,
-  read-only `member` query is used only to prove that the trusted profile holds
-  an authenticated account session before any cart click.
+- Confirmed writes use only the pinned `basketItemsAdd` and `basketItemsUpdate`
+  operations shipped by AH's currently served `/mijnlijst` client. They run as
+  same-origin requests inside the authenticated page; this is personal browser
+  automation, not a public or official API. A separate pinned `member` query
+  proves the trusted profile holds an authenticated account before any write.
 - Search reads fetch the same public `www.ah.be` pages a browser loads, over
   plain HTTPS with the browser's request headers (AH-authorized browser
   mimicry; the edge otherwise answers Access Denied on `/zoeken`). Product
@@ -37,14 +39,20 @@ touches payment.
   flag. Checkout and payment automation do not exist. Once exact line/quantity
   readback succeeds, browser control is released for the human handoff. If AH
   presents its privacy prompt during a confirmed apply, the CLI selects
-  **Weigeren** (necessary cookies only) before the first cart click; it never
+  **Weigeren** (necessary cookies only) before the first basket mutation; it never
   accepts optional advertising or personalization cookies on the user's behalf.
-- Preflight and readback use the exact product links and quantity inputs rendered
-  in `/mijnlijst`, so one list page proves the whole reviewed basket without a
-  product-page crawl. Existing lines are topped up through their own scoped list
-  control; missing lines still use only the selected product page's scoped
-  control. If a later line fails after an earlier click, the CLI prints a partial
-  receipt instead of claiming that nothing changed or guessing a retry.
+- Preflight reads the complete basket through `/mijnlijst`'s own narrow GraphQL
+  query and validates every selected `wi` product ID before any write. Missing
+  products are sent in one add batch; only still-unchanged lower quantities are
+  sent in one update batch after a fresh intervening read. Mutations are never
+  retried automatically. Final GraphQL readback is independently checked against
+  the reloaded visible list. Any post-dispatch uncertainty produces a partial
+  receipt instead of a false success or retry.
+- AH's quantity update has no exposed compare-and-swap version. Do not edit the
+  same basket in another tab or device while `cart apply` runs: the CLI rereads
+  immediately before a top-up and aborts on drift it observes, but a simultaneous
+  write after that read can still be overwritten. Final readback proves the ending
+  state, not transactional isolation.
 - Prices, promotions, availability, and substitutions remain provisional until
   the final browser review.
 
@@ -131,14 +139,15 @@ continue to login, ordering, or payment.
    the execution flag. Unresolved, unavailable, or stale lines block apply.
 5. After reviewing the exact dry-run, use `--confirm-add`. The CLI proves the
    saved profile is authenticated, resolves any delayed privacy prompt to
-   necessary cookies only, changes the winkelmandje, waits for AH's own cart
-   response after every click, then rereads every exact URL and quantity from
-   one fresh `/mijnlijst` page before handing the visible browser to the user.
+   necessary cookies only, computes the complete change set, sends at most one
+   exact add batch, rereads before any safe top-up batch, and then checks every
+   requested product and quantity through both fresh GraphQL and one reloaded
+   `/mijnlijst` page before handing the visible browser to the user.
    An exact line that is already present at the requested quantity is reported
    `already-present` and left untouched; a line present below the requested
    quantity is topped up to exactly the reviewed quantity and reported
-   `topped-up`; a line the cart already holds more of is never reduced and is
-   reported `kept-higher`. Confirmed commands
+   `topped-up`; a line observed above the requested quantity before dispatch is
+   left untouched and reported `kept-higher`. Confirmed commands
    require an interactive terminal so the final browser handoff cannot
    disappear into a background job. If the saved session has expired, the CLI
    stops before any click and asks for one `ah-flex session login`.
@@ -175,11 +184,14 @@ readback. No checkout or ordering page was opened.
 
 ## Session boundary
 
-The CLI never replays captured traffic or guesses a GraphQL write. The dedicated
-profile is created empty and reused afterwards. It can earn its session in the
-visible login flow or receive only the compatible AH-domain cookie rows through
-the explicit local import command. Raw session material never enters output,
-receipts, tests, intermediary files, command arguments, or Git.
+The CLI never replays captured traffic, copies a third-party client, or scrapes
+runtime bundles to discover mutations. Its three basket operations are narrow
+and pinned to the currently served AH `/mijnlijst` contract; schema drift fails
+closed. The dedicated profile is created empty and reused afterwards. It can
+earn its session in the visible login flow or receive only compatible AH-domain
+cookie rows through the explicit local import command. Raw session material
+never enters output, receipts, tests, intermediary files, command arguments, or
+Git.
 
 The implementation is custom. Public grocery MCPs informed the generic safety
 shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or

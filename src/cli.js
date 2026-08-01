@@ -41,12 +41,14 @@ Usage:
   ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
-  cart apply is a dry-run unless --confirm-add is present. Browser writes use a
-  single dedicated persistent Firefox profile. Authenticate it with 'session
+  cart apply is a dry-run unless --confirm-add is present. Confirmed writes stay
+  on authenticated /mijnlijst and use its pinned same-origin basket operations
+  through one dedicated persistent Firefox profile. Authenticate it with 'session
   login', or optionally copy only AH Belgium cookie rows from a closed Firefox
   profile with the macOS-only 'session import-firefox'. Every later run reuses
   that session. The live member query must prove the authenticated account
-  before any cart click.
+  before any basket mutation. Mutations are never retried automatically. Do not
+  edit the same basket in another tab or device while confirmed apply is running.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
   session); --transport browser reads through the same trusted profile.
   Checkout, ordering, payment, substitutions, and implicit product selection do
@@ -261,7 +263,7 @@ async function handleCart(args) {
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {
-      console.log("Visible winkelmandje readback matched every exact product URL and requested quantity.");
+      console.log("Fresh GraphQL and reloaded visible winkelmandje readback matched every exact product and quantity.");
       for (const line of result.receipt.actions) console.log(`${line.action.toUpperCase()} ${line.quantity} × ${line.expected_name}`);
       for (const warning of result.receipt.warnings) console.log(`ATTENTION ${warning}`);
     }
@@ -281,7 +283,7 @@ async function handleCart(args) {
         }
       }
     }
-    if (context) {
+    if (context && error.partialReceipt) {
       console.error("The browser operation stopped before verified completion. Inspect the visible cart; ah-flex cannot operate checkout.");
       await pauseVisibleBrowser("The visible page is being kept open for diagnosis.");
     }
