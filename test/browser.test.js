@@ -258,13 +258,55 @@ test("confirmed orchestration adds exact lines, rereads, and reports honest mism
   assert.match(priceOnlyDrift.warnings[0], /not a hard DOM readback predicate/i);
 });
 
-test("existing exact lines are never silently changed or duplicated", async () => {
+test("existing exact lines are never silently changed, reduced, or duplicated", async () => {
   const basket = actionableBasket();
-  const adapter = {
-    read: async () => [{ url: basket.items[0].selected.url, quantity: 1 }],
-    addExact: async () => assert.fail("must not mutate after an existing-quantity conflict"),
+  const sameQuantity = {
+    read: async () => [
+      { url: basket.items[0].selected.url, quantity: 2 },
+      { url: basket.items[1].selected.url, quantity: 1 },
+      { url: basket.items[2].selected.url, quantity: 3 },
+    ],
+    addExact: async () => assert.fail("must not mutate an exact line that is already at the requested quantity"),
   };
-  await assert.rejects(() => applyBasketWithAdapter(basket, adapter), /Refusing to change existing/);
+  const sameReceipt = await applyBasketWithAdapter(basket, sameQuantity);
+  assert.ok(sameReceipt.actions.every((row) => row.action === "already-present"));
+
+  const higherAdapter = {
+    read: async () => [
+      { url: basket.items[0].selected.url, quantity: 5 },
+      { url: basket.items[1].selected.url, quantity: 1 },
+      { url: basket.items[2].selected.url, quantity: 3 },
+    ],
+    addExact: async () => assert.fail("must not reduce an exact line the human holds more of"),
+  };
+  const higherReceipt = await applyBasketWithAdapter(basket, higherAdapter);
+  assert.equal(higherReceipt.actions[0].action, "kept-higher");
+  assert.equal(higherReceipt.actions[0].observed_quantity, 5);
+  assert.match(higherReceipt.warnings[0], /above the requested 2; left untouched/);
+});
+
+test("an exact line present below the requested quantity is topped up, not duplicated", async () => {
+  const basket = actionableBasket();
+  const rows = [{ url: basket.items[0].selected.url, quantity: 1 }];
+  const calls = [];
+  const adapter = {
+    read: async () => rows.map((row) => ({ ...row })),
+    addExact: async (line) => {
+      calls.push({ ...line });
+      const row = rows.find((candidate) => candidate.url === line.url);
+      if (row) row.quantity = line.quantity;
+      else rows.push({ url: line.url, quantity: line.quantity });
+    },
+  };
+  const receipt = await applyBasketWithAdapter(basket, adapter);
+  assert.equal(receipt.actions[0].action, "topped-up");
+  assert.equal(receipt.actions[0].from_quantity, 1);
+  assert.equal(receipt.actions[0].quantity, 2);
+  assert.deepEqual(calls.map(({ url, quantity }) => ({ url, quantity })), [
+    { url: basket.items[0].selected.url, quantity: 2 },
+    { url: basket.items[1].selected.url, quantity: 1 },
+    { url: basket.items[2].selected.url, quantity: 3 },
+  ]);
 });
 
 test("a later mutation failure carries an honest partial receipt", async () => {

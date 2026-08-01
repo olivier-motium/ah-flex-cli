@@ -112,8 +112,10 @@ continue to login, ordering, or payment.
    saved profile is authenticated, changes the winkelmandje, rereads every
    exact URL and quantity, and hands the visible browser to the user. An exact
    line that is already present at the requested quantity is reported
-   `already-present` and left untouched; an exact line present at a different
-   quantity stops the run rather than silently changing it. Confirmed commands
+   `already-present` and left untouched; a line present below the requested
+   quantity is topped up to exactly the reviewed quantity and reported
+   `topped-up`; a line the cart already holds more of is never reduced and is
+   reported `kept-higher`. Confirmed commands
    require an interactive terminal so the final browser handoff cannot
    disappear into a background job. If the saved session has expired, the CLI
    stops before any click and asks for one `ah-flex session login`.

@@ -220,39 +220,49 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
   try {
     beforeRows = await adapter.read();
     const before = indexSnapshot(beforeRows);
+    const expectedFinal = new Map();
+    const warnings = [];
     for (const line of plan.lines) {
       const existing = before.get(line.url);
       if (existing) {
-        if (existing.quantity !== line.quantity) {
-          throw new BasketError(
-            `Refusing to change existing ${line.url}: current quantity ${existing.quantity ?? "unreadable"}, requested ${line.quantity}`,
+        if (Number.isInteger(existing.quantity) && existing.quantity > line.quantity) {
+          actions.push({ ...line, action: "kept-higher", observed_quantity: existing.quantity });
+          expectedFinal.set(line.url, existing.quantity);
+          warnings.push(
+            `${line.url}: cart already holds quantity ${existing.quantity}, above the requested ${line.quantity}; left untouched`,
           );
+          continue;
         }
-        actions.push({ ...line, action: "already-present" });
-        continue;
+        if (existing.quantity === line.quantity) {
+          actions.push({ ...line, action: "already-present" });
+          expectedFinal.set(line.url, line.quantity);
+          continue;
+        }
       }
-      const action = { ...line, action: "attempted" };
+      const action = { ...line, action: "attempted", ...(existing ? { from_quantity: existing.quantity ?? null } : {}) };
       actions.push(action);
       await adapter.addExact({ url: line.url, quantity: line.quantity, expectedName: line.expected_name });
-      action.action = "added";
+      action.action = existing ? "topped-up" : "added";
+      expectedFinal.set(line.url, line.quantity);
     }
 
     afterRows = await adapter.read();
     const after = indexSnapshot(afterRows);
     const mismatches = [];
     for (const line of plan.lines) {
+      const expected = expectedFinal.get(line.url) ?? line.quantity;
       const observed = after.get(line.url);
       if (!observed) {
         mismatches.push(`${line.url}: exact product missing after apply`);
-      } else if (observed.quantity !== line.quantity) {
+      } else if (observed.quantity !== expected) {
         mismatches.push(
-          `${line.url}: expected quantity ${line.quantity}, observed ${observed.quantity ?? "unreadable"}`,
+          `${line.url}: expected quantity ${expected}, observed ${observed.quantity ?? "unreadable"}`,
         );
       }
     }
     if (mismatches.length) {
       throw new BasketError(
-        `Visible-cart readback failed after ${actions.filter((action) => action.action === "added").length} add(s)`,
+        `Visible-cart readback failed after ${actions.filter((action) => action.action === "added" || action.action === "topped-up").length} cart change(s)`,
         mismatches.map((message) => ({ level: "error", code: "READBACK_MISMATCH", path: "browser", message })),
       );
     }
@@ -262,7 +272,7 @@ export async function applyBasketWithAdapter(basket, adapter, options = {}) {
       actions,
       before: [...before.values()],
       after: afterRows,
-      warnings: ["Current prices are visible for human review but are not a hard DOM readback predicate."],
+      warnings: [...warnings, "Current prices are visible for human review but are not a hard DOM readback predicate."],
     };
   } catch (cause) {
     if (!afterRows.length && actions.some((action) => action.action === "attempted" || action.action === "added")) {
@@ -642,37 +652,46 @@ export async function findPdpPlusButton(page) {
 async function addExactToVisibleList(page, line) {
   const url = await gotoExactProduct(page, line.url);
   await assertCookiePopupAbsent(page);
-  const existingQuantity = await readPdpQuantity(page);
-  if (Number.isInteger(existingQuantity) && existingQuantity >= 1) {
-    throw new BasketError(`Exact product ${url} is already present; refusing a duplicate add`);
-  }
-  const addButton = await findPdpAddButton(page);
-  if (!addButton) {
+  let currentQuantity = await readPdpQuantity(page);
+  if (Number.isInteger(currentQuantity) && currentQuantity > line.quantity) {
     throw new BasketError(
-      `Exact product ${url} is already present or has unreadable controls; refusing a duplicate add`,
+      `Exact product ${url} is already at quantity ${currentQuantity}, above the requested ${line.quantity}; refusing to reduce`,
     );
   }
-  if (!(await addButton.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
-  try {
-    await addButton.click({ timeout: 12_000 });
-  } catch {
-    throw new BasketError(`The scoped add control for exact product ${url} could not be clicked`);
+  if (currentQuantity === line.quantity) {
+    throw new BasketError(
+      `Exact product ${url} is already at the requested quantity ${line.quantity}; refusing a duplicate add`,
+    );
   }
-  assertAllowedAutomationUrl(page.url());
-  await waitForPdpQuantity(page, 1, url);
+  if (!Number.isInteger(currentQuantity) || currentQuantity < 1) {
+    const addButton = await findPdpAddButton(page);
+    if (!addButton) {
+      throw new BasketError(
+        `Exact product ${url} has no scoped add button and no readable quantity; refusing an ambiguous add`,
+      );
+    }
+    if (!(await addButton.isEnabled())) throw new BasketError(`Exact product ${url} is not currently addable`);
+    try {
+      await addButton.click({ timeout: 12_000 });
+    } catch {
+      throw new BasketError(`The scoped add control for exact product ${url} could not be clicked`);
+    }
+    assertAllowedAutomationUrl(page.url());
+    await waitForPdpQuantity(page, 1, url);
+    currentQuantity = 1;
+  }
 
-  if (line.quantity > 1) {
+  while (currentQuantity < line.quantity) {
     const plus = await findPdpPlusButton(page);
     if (!plus) throw new BasketError(`Quantity control for exact product ${url} could not be read`);
-    for (let currentQuantity = 1; currentQuantity < line.quantity; currentQuantity += 1) {
-      try {
-        await plus.click({ timeout: 12_000 });
-      } catch {
-        throw new BasketError(`The quantity control for exact product ${url} could not be clicked`);
-      }
-      assertAllowedAutomationUrl(page.url());
-      await waitForPdpQuantity(page, currentQuantity + 1, url);
+    try {
+      await plus.click({ timeout: 12_000 });
+    } catch {
+      throw new BasketError(`The quantity control for exact product ${url} could not be clicked`);
     }
+    assertAllowedAutomationUrl(page.url());
+    await waitForPdpQuantity(page, currentQuantity + 1, url);
+    currentQuantity += 1;
   }
 }
 
