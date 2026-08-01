@@ -35,7 +35,7 @@ Usage:
   ah-flex basket review <basket.json> --out <review.html> [--open]
   ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
   ah-flex session login
-  ah-flex session status
+  ah-flex session status [--json]
   ah-flex cart apply <basket.json> [--confirm-add] [--json]
 
 Safety:
@@ -174,9 +174,15 @@ async function handleSearch(args) {
 
 async function handleSession(args) {
   const action = args.shift();
+  const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   if (action === "status") {
     const status = await sessionStatus();
+    if (asJson) {
+      console.log(JSON.stringify(status, null, 2));
+      if (status.state !== "authenticated") process.exitCode = 1;
+      return;
+    }
     if (status.state === "authenticated") {
       console.log("AH session is authenticated; 'cart apply --confirm-add' can use it.");
     } else if (status.state === "anonymous") {

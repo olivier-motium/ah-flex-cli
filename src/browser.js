@@ -707,6 +707,17 @@ async function ensureAhOriginPage(page) {
   }
 }
 
+const LOGIN_LANDING_HTML = `<!doctype html>
+<meta charset="utf-8">
+<title>ah-flex login window</title>
+<body style="font-family:system-ui,-apple-system,sans-serif;background:#00a0e4;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="max-width:660px;text-align:center;padding:24px">
+<h1 style="font-size:34px;margin:0 0 16px">This is the ah-flex window</h1>
+<p style="font-size:20px;line-height:1.5">Your everyday Firefox login does <b>not</b> count here. This fresh, empty profile needs its own one-time AH account login.</p>
+<p style="margin:32px 0"><a href="https://www.ah.be/inloggen" style="display:inline-block;background:#fff;color:#00a0e4;font-size:24px;padding:16px 36px;border-radius:10px;text-decoration:none;font-weight:700">Open ah.be login &rarr;</a></p>
+<p style="font-size:14px;opacity:.85">ah-flex watches until the account session is active, then closes this window. It never sees your credentials.</p>
+</div>`;
+
 export async function runInteractiveLogin(options = {}) {
   const context = await launchAhProfileContext({ ...options, guarded: false });
   const memberRequest = createMemberRequest();
@@ -715,7 +726,12 @@ export async function runInteractiveLogin(options = {}) {
   const deadline = Date.now() + timeoutMs;
   try {
     const page = await activePage(context);
-    await page.goto(`${AH_ORIGIN}/inloggen`, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+    await page
+      .goto(`data:text/html;charset=utf-8,${encodeURIComponent(LOGIN_LANDING_HTML)}`, {
+        waitUntil: "domcontentloaded",
+        timeout: 15_000,
+      })
+      .catch(() => {});
     let probe = await context.newPage();
     let announced = false;
     for (;;) {
@@ -747,14 +763,29 @@ export async function sessionStatus(options = {}) {
   try {
     const page = await activePage(context);
     await safeGoto(page, `${AH_ORIGIN}/`);
-    if (await readAccessDenied(page)) return { state: "denied" };
-    let probeFailed = false;
-    const result = await probeMemberState(page, createMemberRequest()).catch(() => {
-      probeFailed = true;
-      return null;
-    });
-    if (probeFailed) return { state: "unknown" };
-    return { state: interpretMemberProbe(result) ? "authenticated" : "anonymous" };
+    const homeDenied = await readAccessDenied(page);
+    let probe = null;
+    let probeError = false;
+    try {
+      probe = await probeMemberState(page, createMemberRequest());
+    } catch {
+      probeError = true;
+    }
+    await safeGoto(page, `${AH_ORIGIN}/mijnlijst`).catch(() => {});
+    const listDenied = await readAccessDenied(page);
+    const state = homeDenied
+      ? "denied"
+      : probeError
+        ? "unknown"
+        : interpretMemberProbe(probe)
+          ? "authenticated"
+          : "anonymous";
+    return {
+      state,
+      home: { url: `${AH_ORIGIN}/`, accessDenied: homeDenied },
+      memberProbe: probe,
+      mijnlijst: { url: page.url(), accessDenied: listDenied },
+    };
   } finally {
     await context.close();
   }
