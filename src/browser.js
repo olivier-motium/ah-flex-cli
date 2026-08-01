@@ -715,6 +715,7 @@ const LOGIN_LANDING_HTML = `<!doctype html>
 <h1 style="font-size:34px;margin:0 0 16px">This is the ah-flex window</h1>
 <p style="font-size:20px;line-height:1.5">Your everyday Firefox login does <b>not</b> count here. This fresh, empty profile needs its own one-time AH account login.</p>
 <p style="margin:32px 0"><a href="https://www.ah.be/inloggen" style="display:inline-block;background:#fff;color:#00a0e4;font-size:24px;padding:16px 36px;border-radius:10px;text-decoration:none;font-weight:700">Open ah.be login &rarr;</a></p>
+<p style="font-size:16px;line-height:1.5;background:rgba(0,0,0,.18);border-radius:10px;padding:14px 18px">If AH emails you a login link or code: <b>copy the link and paste it into THIS window's address bar</b> (or type the code here). Clicking the link in your mail opens your everyday browser and the login lands there instead.</p>
 <p style="font-size:14px;opacity:.85">ah-flex watches until the account session is active, then closes this window. It never sees your credentials.</p>
 </div>`;
 
