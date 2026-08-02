@@ -1,233 +1,224 @@
-# ah-flex-cli
+# AH Flex CLI
 
-`ah-flex` is a personal, agent-friendly CLI for preparing a flexible Albert
-Heijn Belgium basket without turning the week into a fixed meal plan.
+Build a flexible Albert Heijn Belgium basket with an AI agent, review every
+exact product, then add it to your AH basket in a browser you logged into once.
 
-The core idea is **components, not menus**: the agent chooses a useful mix of
-pantry, freezer, and fresh ingredients that can be recombined in several ways.
-The CLI validates the basket, normalizes unit prices, refreshes visible product
-facts, renders a review sheet, and can prepare the **winkelmandje** at
-`/mijnlijst` through a visible browser session. It never places an order or
-touches payment.
+AH Flex is built around **components, not a weekly menu**. It helps an agent
+combine pantry, freezer, and fresh food that can be used in several meals,
+compare current pack and unit prices, and prepare the basket without automating
+checkout or payment.
 
-## Boundaries
+> [!IMPORTANT]
+> AH Flex is an unofficial open-source project. It is not affiliated with,
+> endorsed by, or supported by Albert Heijn. Product data and browser flows can
+> change; review the basket on ah.be before ordering.
 
-- This is a custom personal-use browser helper, not an official AH integration.
-- Confirmed writes use only the pinned `basketItemsAdd` and `basketItemsUpdate`
-  operations shipped by AH's currently served `/mijnlijst` client. They run as
-  same-origin requests inside the authenticated page; this is personal browser
-  automation, not a public or official API. A separate pinned `member` query
-  proves the trusted profile holds an authenticated account before any write.
-- Default search reads fetch public `www.ah.be` pages over plain HTTPS with a
-  pinned browser header set; the edge otherwise answers Access Denied on
-  `/zoeken`. Product facts come from the structured payload embedded in those
-  pages, not from screen scraping. This default transport sends no cookies or
-  stored session values. The optional browser diagnostic transport uses the
-  dedicated persistent profile described below.
-- Browser writes use one fixed dedicated persistent profile per supported browser,
-  selected with `--browser` and owned by the CLI:
-  `firefox` is Firefox through the `moz-firefox` channel at
-  `~/.ah-flex/firefox-profile`, `chrome` is Google Chrome through the `chrome`
-  channel at `~/.ah-flex/chrome-profile`, and `edge` is Microsoft Edge through
-  the `msedge` channel at `~/.ah-flex/edge-profile`. The unflagged default is
-  Firefox, preserving the original default path and behavior. The CLI exposes
-  no profile-directory override, fallback, browser discovery, config import, or
-  everyday-browser profile import. Before any selected browser launches, its
-  final path component must be a current-user-owned directory with exactly
-  private mode `0700`; a missing target is created once with `0700` and its
-  effective mode is verified. Existing symlinks, non-directories, wrong-owner
-  targets, and broader modes are rejected without chmodding them. Each selected
-  browser profile needs its own one-time visible login; profiles never share
-  cookies, tokens, or profile databases. A confirmed apply uses the existing
-  selected-browser session immediately; if AH says that profile is cleanly
-  anonymous, it opens login in that same dedicated window and resumes the
-  reviewed apply automatically. `session login` is an optional setup/repair
-  command. Authentication stays in the browser-owned profile, which every
-  later run reuses; the CLI does not inspect or copy browser cookie, token, or
-  profile database data. Password entry and verification codes stay outside the
-  CLI.
-- Cart/list changes are dry-run by default and require an explicit execution
-  flag. Checkout and payment automation do not exist. Once exact line/quantity
-  readback succeeds, browser control is released for the human handoff. If AH
-  presents its privacy prompt during a confirmed apply, the CLI selects
-  **Weigeren** (necessary cookies only) before the first basket mutation; it never
-  accepts optional advertising or personalization cookies on the user's behalf.
-- Preflight reads the complete basket through `/mijnlijst`'s own narrow GraphQL
-  query and validates every selected `wi` product ID before any write. Missing
-  products are sent in one add batch; only still-unchanged lower quantities are
-  sent in one update batch after a fresh intervening read. Mutations are never
-  retried automatically. Final GraphQL readback is independently checked against
-  the reloaded visible list. Any post-dispatch uncertainty produces a partial
-  receipt instead of a false success or retry.
-- AH's quantity update has no exposed compare-and-swap version. Do not edit the
-  same basket in another tab or device while `cart apply` runs: the CLI rereads
-  immediately before a top-up and aborts on drift it observes, but a simultaneous
-  write after that read can still be overwritten. Final readback proves the ending
-  state, not transactional isolation.
-- Prices, promotions, availability, and substitutions remain provisional until
-  the final browser review.
+## Add it to local Codex
 
-## Intended workflow
+The easiest path is to paste this into Codex, including a Codex surface in the
+ChatGPT desktop app when it has access to the filesystem and terminal on the
+same computer:
 
 ```text
-You:   "Next week: chicken and beef, healthy, flexible, buy bulk where useful."
-Agent: searches current AH products, compares pack/unit prices, and writes one
-       small basket JSON file across pantry/freezer/fresh.
-CLI:   checks the basket, makes gaps and stale prices visible, renders review,
-       and—after explicit confirmation—adds the selected products to the visible winkelmandje.
-You:   review the visible list and place the order yourself.
+Install the AH Flex skill from https://github.com/olivier-motium/ah-flex-cli:
+create `$HOME/.agents/skills`, clone the repository into
+`$HOME/.agents/skills/ah-flex-cli`, run `npm install` there, and verify it with
+`node "$HOME/.agents/skills/ah-flex-cli/src/cli.js" --help`. If that destination
+already exists, stop and tell me instead of overwriting it. Do not sign in or
+change my AH basket yet.
 ```
 
-No recipes, weekday slots, pantry database, inventory daemon, nutrition score,
-or auto-substitution engine are part of the product.
+After installation, ask for it explicitly with `$ah-flex-cli` in Codex. For
+example:
 
-## Install
+```text
+$ah-flex-cli Build a protein-rich basket for two adults and two children for
+3.5 days. One adult avoids gluten. Prefer versatile ingredients, freezer value,
+and a small fresh-food top-up. Review everything before changing my cart.
+```
 
-Requires Node.js 20+ and at least one current local installation of Firefox,
-Google Chrome, or Microsoft Edge. Firefox remains the default. Select Chrome or
-Edge explicitly with `--browser chrome` or `--browser edge`.
+If the skill does not appear immediately after installation, restart Codex.
+
+ChatGPT and Codex share the same skill format, but ordinary ChatGPT web chats
+cannot execute a CLI or control a browser on your computer merely from a GitHub
+URL. A future skills-only plugin publication would make AH Flex discoverable on
+supported ChatGPT and Codex surfaces, invoked with `@ah-flex-cli` in ChatGPT or
+`$ah-flex-cli` in Codex. Until then, use local Codex or a local Codex surface in
+ChatGPT desktop.
+
+## Install manually
+
+Requirements:
+
+- macOS or Linux
+- Git
+- Node.js 20 or newer
+- Firefox, Google Chrome, or Microsoft Edge for login and cart preparation
+- an AH Belgium account if you want to add products to a basket
+
+Install the CLI:
 
 ```sh
+git clone https://github.com/olivier-motium/ah-flex-cli.git
+cd ah-flex-cli
 npm install
 npm link
 ah-flex --help
 ```
 
-The opt-in installed-browser lifecycle proof runs with:
+To install the repository as a personal Codex skill without `npm link`, clone it
+directly into the personal skill directory:
+
+```sh
+mkdir -p "$HOME/.agents/skills"
+git clone https://github.com/olivier-motium/ah-flex-cli.git \
+  "$HOME/.agents/skills/ah-flex-cli"
+npm --prefix "$HOME/.agents/skills/ah-flex-cli" install
+node "$HOME/.agents/skills/ah-flex-cli/src/cli.js" --help
+```
+
+Codex detects the root [`SKILL.md`](SKILL.md). Restart Codex if the new skill is
+not listed. The skill invokes the checked-out CLI directly, so a global npm link
+is optional.
+
+Change into the installed repository before using the examples below. They use
+`node src/cli.js`, which works for either installation path. If you ran
+`npm link`, `ah-flex` is an equivalent shorter command.
+
+## First basket
+
+Create a basket template from a plain-language brief:
+
+```sh
+node src/cli.js template \
+  --brief "protein-rich family food for 3.5 days, gluten-free alternatives" \
+  --out basket.json
+```
+
+Search current AH Belgium products and compare the returned candidates:
+
+```sh
+node src/cli.js search "kipfilet voordeelverpakking" --limit 8 --json
+node src/cli.js search "glutenvrij brood" --limit 8 --json
+```
+
+Fill each `selected` field in `basket.json` with one exact result, then validate
+and render a review:
+
+```sh
+node src/cli.js basket check basket.json
+node src/cli.js basket review basket.json --out review.html --open
+node src/cli.js cart apply basket.json
+```
+
+The last command is a dry-run. It shows what would change without touching your
+AH basket.
+
+When the exact products and quantities are correct, apply them in a visible
+browser:
+
+```sh
+node src/cli.js cart apply basket.json --browser firefox --confirm-add
+```
+
+Confirmed apply and `session login` require an interactive terminal so the
+visible browser can be handed to you. If the agent's shell is non-interactive,
+have it print the exact reviewed command and paste that command into your own
+terminal.
+
+On the first confirmed run, AH Flex opens a dedicated browser profile. Log in
+there once; later runs reuse that browser-owned session. Chrome and Edge are
+also supported:
+
+```sh
+node src/cli.js session login --browser chrome
+node src/cli.js session status --browser chrome
+node src/cli.js cart apply basket.json --browser chrome --confirm-add
+```
+
+Each browser has a separate profile and therefore needs its own one-time login.
+Safari is not supported because Safari automation cannot reuse the human-owned
+persistent profile this workflow requires.
+
+## What the agent should do
+
+1. Ask for the household, time horizon, dietary constraints, priorities, and
+   foods that are already available.
+2. Plan versatile pantry, freezer, and fresh components instead of assigning a
+   fixed meal to every day.
+3. Search current products and compare exact pack sizes, unit prices,
+   availability, and promotions. Never silently choose the first result.
+4. Write the selected product URL and facts into the basket JSON.
+5. Run `basket check`, create the review, and run the cart dry-run.
+6. Change the live basket only after the user confirms the exact dry-run.
+7. Leave checkout, substitutions, and payment to the user.
+
+The checked-in [`examples/chicken-beef.json`](examples/chicken-beef.json) is an
+unresolved example brief. It intentionally contains no stale or invented
+product selection.
+
+## Commands
+
+```text
+ah-flex template --brief "chicken and beef next week" [--out basket.json]
+ah-flex schema
+ah-flex basket check basket.json [--json]
+ah-flex basket review basket.json --out review.html [--open]
+ah-flex search "kipfilet" [--limit 8] [--transport http|browser] [--browser firefox|chrome|edge] [--json]
+ah-flex session login [--browser firefox|chrome|edge]
+ah-flex session status [--browser firefox|chrome|edge] [--json]
+ah-flex cart apply basket.json [--browser firefox|chrome|edge] [--confirm-add] [--json]
+```
+
+`search` uses the cookie-free HTTP transport by default. The optional browser
+transport uses the selected dedicated profile as a diagnostic fallback. Neither
+transport retries automatically after an Access Denied response.
+
+## Safety and privacy
+
+- Basket changes are dry-run by default and require `--confirm-add` in an
+  interactive terminal.
+- AH Flex validates the complete current basket before writing, sends each
+  required mutation at most once, and reads the result back. An uncertain write
+  returns a partial receipt instead of retrying.
+- Do not edit the same basket from another tab or device while a confirmed apply
+  is running. AH does not expose transactional versioning for quantity updates.
+- Browser profiles live at `~/.ah-flex/{firefox,chrome,edge}-profile` with
+  private permissions. The CLI never reads, copies, prints, exports, or migrates
+  cookies, tokens, passwords, or browser databases.
+- Automated page navigation is guarded to bounded `https://www.ah.be/` pages
+  until verified basket readback.
+- Checkout, ordering, payment, accepting substitutions, and automatic product
+  selection are deliberately out of scope.
+- Prices, promotions, availability, and substitutions remain provisional until
+  the final review on ah.be.
+
+The basket operations are narrow, pinned calls made inside AH's own authenticated
+`/mijnlijst` page. They are not a public or official AH API. Schema or page drift
+fails closed.
+
+## Development
+
+```sh
+npm install
+npm test
+npm run check
+```
+
+The optional installed-browser lifecycle check opens temporary visible Firefox,
+Chrome, and Edge windows against a local `127.0.0.1` fixture only:
 
 ```sh
 npm run test:e2e:browsers
 ```
 
-This command launches visible temporary Firefox, Google Chrome, and Microsoft
-Edge windows sequentially. Its automated page traffic is constrained to a
-`127.0.0.1` fixture; Playwright page routing is not an OS-level firewall for a
-browser's own background services. Passing proves installed-browser profile
-creation and localStorage persistence across a close/relaunch; it is not AH
-authentication proof or cart proof.
+That test proves local profile creation and persistence. It does not prove AH
+authentication or make a live basket change.
 
-Confirmed writes use the selected installed browser through Playwright's
-branded browser channel. All automation runs in that browser's dedicated
-persistent profile, so the site sees the same returning browser you logged into
-once — not a fresh throwaway profile on every run.
+Contributions are welcome. Keep live credentials and browser profiles out of
+issues, fixtures, logs, and pull requests. For security-sensitive reports, open
+a minimal issue without secrets or session material.
 
-Safari is deliberately not a selector. Safari WebDriver creates isolated
-automation sessions and cannot supply the reusable, browser-owned human-login
-profile this CLI requires. Playwright's WebKit build is a test browser, not
-Safari, so `--browser safari` and `--browser webkit` both fail with an explicit
-explanation instead of silently launching a substitute or changing Safari
-security settings.
+## License
 
-## Command surface
-
-```text
-ah-flex template --brief "chicken and beef next week"
-ah-flex basket check basket.json [--json]
-ah-flex basket review basket.json --out review.html [--open]
-ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--browser firefox|chrome|edge] [--json]
-ah-flex session login [--browser firefox|chrome|edge]       # optional setup/repair
-ah-flex session status [--browser firefox|chrome|edge]
-ah-flex cart apply basket.json [--browser firefox|chrome|edge]                 # dry-run
-ah-flex cart apply basket.json --browser chrome --confirm-add
-```
-
-`search` defaults to the HTTP transport, which needs no login and no browser.
-`--transport browser` reads through the trusted profile as a diagnostic
-fallback. Neither transport retries automatically after an Access Denied.
-
-`session login` is an optional setup/repair command: it opens the selected
-browser's dedicated profile on ah.be and waits until the pinned member query
-proves the account session is active, then closes the browser. A normal
-confirmed apply does not require it first. If AH has expired the selected
-profile's saved session, the confirmed command opens login in that same AH
-window and resumes that reviewed apply automatically. If AH emails a login
-link, open or paste it in that dedicated window so the session lands in the
-reusable profile rather than your everyday browser. Each browser has its own
-login; switching `--browser` does not copy session data. `session status`
-additionally proves that `/mijnlijst` is usable and not denied; it exits
-non-zero unless both checks make that selected profile ready for cart apply.
-
-Authentication is established only through the visible browser login in the
-dedicated profile. The CLI never sees credentials or session values.
-`session status` uses the live member query and usable `/mijnlijst` page as the
-authentication gate.
-
-During automation, the browser adapter targets bounded pages on
-`https://www.ah.be/` only and fails closed when the site's accessible controls
-no longer match. After verified readback it removes that automation guard and
-leaves the final winkelmandje visible; the user remains the only person who can
-continue to login, ordering, or payment.
-
-## Agent workflow
-
-1. Start from `ah-flex template --brief "..."` or
-   [`examples/chicken-beef.json`](examples/chicken-beef.json).
-2. Let the agent run `ah-flex search "..." --json` for each component and
-   compare price per kg, litre, or piece. Search returns candidates; it never
-   silently selects the first result.
-3. The agent writes the chosen exact AH Belgium URL and current product facts
-   into each `selected` field.
-4. Run `basket check`, generate the static review, then run `cart apply` without
-   the execution flag. Unresolved, unavailable, or stale lines block apply.
-5. After reviewing the exact dry-run, use `--confirm-add`. The CLI proves the
-   saved profile is authenticated, resolves any delayed privacy prompt to
-   necessary cookies only, computes the complete change set, sends at most one
-   exact add batch, rereads before any safe top-up batch, and then checks every
-   requested product and quantity through both fresh GraphQL and one reloaded
-   `/mijnlijst` page before handing the visible browser to the user.
-   An exact line that is already present at the requested quantity is reported
-   `already-present` and left untouched; a line present below the requested
-   quantity is topped up to exactly the reviewed quantity and reported
-   `topped-up`; a line observed above the requested quantity before dispatch is
-   left untouched and reported `kept-higher`. Confirmed commands
-   require an interactive terminal so the final browser handoff cannot
-   disappear into a background job. If AH has expired the saved session, the
-   command asks you to log in in the dedicated AH window and resumes this same
-   reviewed apply automatically. A separate `session login` is optional.
-
-The checked-in chicken-and-beef example is intentionally unresolved: it is the
-recombinable component brief, not fake or stale product data.
-
-## Current live boundary
-
-The data model, report, dry-run, URL guards, fact normalization, and
-write/readback orchestration have local test coverage. Firefox, Google Chrome,
-and Microsoft Edge branded-channel/profile lifecycle checks are available as a
-local opt-in E2E suite. The live read canary
-passed on 2026-07-31: `search` over the HTTP transport returned exact product
-URLs, prices, packs, and unit prices from `www.ah.be` after the Akamai edge
-had denied both curl and the automated browser profile on `/zoeken`. The
-browser-mimicking header set is pinned in `src/http-ah.js`; if AH starts
-denying it, refresh the pinned Chrome version there.
-
-The earlier fresh-profile session modes (guest consent bootstrap and HAR replay)
-were removed on 2026-08-01 after the live guest write was denied before the
-first click. The dedicated persistent profile replaces them: it is initialized
-once and then reused as the same returning browser. Authentication is established
-only in that browser-owned profile, and `session status` remains the live gate.
-
-The write target is the AH page at `/mijnlijst`, which AH labels
-**Winkelmandje**. Turning that reviewed cart into an order remains a human
-action.
-
-The authenticated write/readback canary passed on 2026-08-01: 10 missing exact
-lines were added in one batch, 26 existing exact lines were preserved, and
-36 products / 42 packs were verified by fresh GraphQL and reloaded DOM
-readbacks. No checkout or ordering page was opened. The anonymous-to-login
-same-command continuation is covered locally; its first clean-profile live run
-has not yet been repeated against AH.
-
-## Session boundary
-
-The CLI never replays captured traffic, copies a third-party client, or scrapes
-runtime bundles to discover mutations. Its three basket operations are narrow
-and pinned to the currently served AH `/mijnlijst` contract; schema drift fails
-closed. The dedicated profile is created empty and reused afterwards. It can
-earn and retain its session through the visible browser login flow; the CLI does
-not inspect, copy, export, or migrate browser cookie or token data. Raw session
-material never enters output, receipts, tests, intermediary files, command
-arguments, or Git.
-
-The implementation is custom. Public grocery MCPs informed the generic safety
-shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or
-MCP code is copied or linked into the runtime.
+[MIT](LICENSE)
