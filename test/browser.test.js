@@ -3,20 +3,28 @@ import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { chromium, firefox } from "playwright-core";
 import {
+  BROWSER_REGISTRY,
   applyBasketWithAdapter,
+  applyBasketInVisibleBrowser,
   attachVerifiedReceipt,
   assertAllowedAutomationUrl,
   assertCookiePopupAbsent,
   buildApplyPlan,
+  closeVisibleAhBrowser,
   ensureNecessaryCookiePreference,
   ensureProfileDir,
+  interpretAnonymousMemberProbe,
   interpretMemberProbe,
   isAllowedAutomationUrl,
   normalizeProductCandidate,
   normalizeVisibleListRows,
+  resolveBrowser,
   resolveProfileDir,
+  runInteractiveLogin,
   verifyAuthenticatedMember,
+  visibleChromiumLaunchOptions,
   visibleFirefoxLaunchOptions,
 } from "../src/browser.js";
 import { BasketError } from "../src/basket.js";
@@ -46,6 +54,162 @@ function actionableBasket() {
     title: "Actionable",
     brief: "Exact products across all storage types",
     items: [make("wi111111", "freezer", 2), make("wi222222", "fresh", 1), make("wi333333", "pantry", 3)],
+  };
+}
+
+function fakeMemberProbe(state) {
+  if (state === "object") {
+    return { status: 200, jsonObject: true, errorsClear: true, hasMember: true, memberState: "object" };
+  }
+  if (state === "null") {
+    return { status: 200, jsonObject: true, errorsClear: true, hasMember: true, memberState: "null" };
+  }
+  if (state === "denied") {
+    return { status: 403, jsonObject: true, errorsClear: true, hasMember: true, memberState: "null" };
+  }
+  return { status: 200, jsonObject: true, errorsClear: true, hasMember: true, memberState: "other" };
+}
+
+function fakeApplyBrowser({
+  mainMember = ["object"],
+  probeMember = ["null"],
+  denied = false,
+  closeLoginOnFront = false,
+  loginRedirect = null,
+}) {
+  const events = [];
+  const mutations = [];
+  const pages = [];
+  const basketRows = new Map();
+  let contextClosed = false;
+  let probeCount = 0;
+  let mainMemberIndex = 0;
+  let probeMemberIndex = 0;
+
+  const urlForId = (id) => `https://www.ah.be/producten/product/wi${id}/exact-wi${id}`;
+  const basketSnapshot = () => ({
+    itemsInList: [...basketRows].map(([id, quantity]) => ({ id, quantity })),
+    externalItems: [],
+    itemsInOrder: [],
+  });
+
+  const makePage = (name) => {
+    let currentUrl = "about:blank";
+    let closed = false;
+    let frontCalls = 0;
+    return {
+      name,
+      goto: async (target) => {
+        if (closed) throw new Error(`${name} is closed`);
+        currentUrl = name === "main" && target.endsWith("/inloggen") && loginRedirect ? loginRedirect : target;
+        events.push(`goto:${name}:${target}`);
+      },
+      reload: async () => {
+        if (closed) throw new Error(`${name} is closed`);
+        events.push(`reload:${name}`);
+      },
+      url: () => currentUrl,
+      isClosed: () => closed,
+      close: async () => {
+        closed = true;
+        events.push(`close:${name}`);
+      },
+      bringToFront: async () => {
+        frontCalls += 1;
+        if (closeLoginOnFront && name === "main" && frontCalls === 1) {
+          closed = true;
+          events.push("close:main");
+          throw new Error("login window closed");
+        }
+        if (closed) throw new Error(`${name} is closed`);
+        events.push(`front:${name}`);
+      },
+      waitForLoadState: async () => {},
+      locator: (selector) => {
+        if (selector === "body") {
+          return { innerText: async () => (denied ? "Access Denied" : "Mijn lijst") };
+        }
+        if (selector === '[data-testid="cookie-popup"]') {
+          return {
+            isVisible: async () => false,
+            waitFor: async () => {
+              throw new Error("cookie popup absent");
+            },
+          };
+        }
+        if (selector.startsWith('a[href*="/producten/product/"]')) {
+          return {
+            first: () => ({ waitFor: async () => {} }),
+            evaluateAll: async () =>
+              [...basketRows].map(([id, quantity]) => ({ href: urlForId(id), values: [String(quantity)] })),
+          };
+        }
+        throw new Error(`unexpected locator ${selector}`);
+      },
+      evaluate: async (_fn, input) => {
+        if (input?.body?.operationName === "member") {
+          events.push(`member:${name}`);
+          const states = name === "probe" ? probeMember : mainMember;
+          const index = name === "probe" ? probeMemberIndex++ : mainMemberIndex++;
+          const state = states[Math.min(index, states.length - 1)];
+          if (state === "error") throw new Error("transient member probe failure");
+          return fakeMemberProbe(state);
+        }
+        const operation = input?.body?.operationName;
+        if (operation === "basket") {
+          events.push("graphql-read");
+          return { status: 200, tooLarge: false, json: { errors: [], data: { basket: basketSnapshot() } } };
+        }
+        if (operation === "basketItemsAdd" || operation === "basketItemsUpdate") {
+          events.push(`mutation:${operation}`);
+          const items = input.body.variables.items;
+          mutations.push({ operation, items: items.map((item) => ({ id: item.id, quantity: item.quantity })) });
+          for (const item of items) basketRows.set(item.id, item.quantity);
+          return {
+            status: 200,
+            tooLarge: false,
+            json: { errors: [], data: { [operation]: { result: basketSnapshot() } } },
+          };
+        }
+        throw new Error(`unexpected evaluate operation ${operation}`);
+      },
+    };
+  };
+
+  const main = makePage("main");
+  pages.push(main);
+  const context = {
+    pages: () => {
+      if (contextClosed) throw new Error("context is closed");
+      return pages.filter((page) => !page.isClosed());
+    },
+    newPage: async () => {
+      probeCount += 1;
+      const probe = makePage("probe");
+      pages.push(probe);
+      events.push("new-probe");
+      return probe;
+    },
+    route: async () => events.push("guard-installed"),
+    unroute: async () => events.push("guard-released"),
+    close: async () => {
+      if (contextClosed) return;
+      contextClosed = true;
+      for (const page of pages) await page.close();
+      events.push("context-closed");
+    },
+  };
+  return {
+    context,
+    main,
+    events,
+    mutations,
+    get probeCount() {
+      return probeCount;
+    },
+    get contextClosed() {
+      return contextClosed;
+    },
   };
 }
 
@@ -95,6 +259,60 @@ test("visible browser uses stock Firefox in non-headless mode with a quiet dedic
   assert.equal(options.viewport, null);
   assert.equal(options.firefoxUserPrefs["browser.aboutwelcome.enabled"], false);
   assert.equal(options.firefoxUserPrefs["browser.shell.checkDefaultBrowser"], false);
+});
+
+test("browser registry exposes the exact supported names, channels, labels, and profile leaves", () => {
+  assert.deepEqual(Object.keys(BROWSER_REGISTRY), ["firefox", "chrome", "edge"]);
+  assert.equal(resolveBrowser(), BROWSER_REGISTRY.firefox);
+  assert.equal(resolveProfileDir(), path.join(os.homedir(), ".ah-flex", "firefox-profile"));
+  assert.equal(resolveProfileDir({ browser: "firefox" }), path.join(os.homedir(), ".ah-flex", "firefox-profile"));
+
+  const expected = {
+    firefox: { label: "Firefox", channel: "moz-firefox", profile: "firefox-profile", browserType: firefox },
+    chrome: { label: "Google Chrome", channel: "chrome", profile: "chrome-profile", browserType: chromium },
+    edge: { label: "Microsoft Edge", channel: "msedge", profile: "edge-profile", browserType: chromium },
+  };
+  for (const [name, facts] of Object.entries(expected)) {
+    const browser = resolveBrowser(name);
+    assert.equal(browser.name, name);
+    assert.equal(browser.label, facts.label);
+    assert.equal(browser.channel, facts.channel);
+    assert.equal(browser.browserType, facts.browserType);
+    assert.equal(browser.profileDir, path.join(".ah-flex", facts.profile));
+    assert.equal(resolveProfileDir({ browser: name }), path.join(os.homedir(), ".ah-flex", facts.profile));
+  }
+});
+
+test("Chromium launch options are visible and contain no Firefox preferences", () => {
+  assert.deepEqual(visibleChromiumLaunchOptions("chrome"), {
+    channel: "chrome",
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
+  });
+  assert.deepEqual(BROWSER_REGISTRY.edge.launchOptions(), {
+    channel: "msedge",
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
+  });
+  assert.equal(Object.hasOwn(visibleChromiumLaunchOptions("chrome"), "firefoxUserPrefs"), false);
+  assert.equal(Object.hasOwn(BROWSER_REGISTRY.edge.launchOptions(), "firefoxUserPrefs"), false);
+});
+
+test("Safari, WebKit, and unknown browsers reject before a profile can be created", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-browser-rejections-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.throws(() => resolveBrowser("safari"), /Safari is not supported.*Playwright WebKit is not Safari/);
+  assert.throws(() => resolveBrowser("webkit"), /WebKit is not supported.*not Safari/);
+  assert.throws(() => resolveBrowser("opera"), /Unknown browser 'opera'.*firefox, chrome, edge/);
+
+  for (const name of ["safari", "webkit", "opera"]) {
+    const profile = path.join(root, `${name}-profile`);
+    await assert.rejects(() => ensureProfileDir({ browser: name, profileDir: profile }));
+    await assert.rejects(lstat(profile), (error) => error?.code === "ENOENT");
+  }
 });
 
 test("the trusted profile fails closed if the consent UI reappears", async () => {
@@ -171,6 +389,31 @@ test("profile launch boundary rejects broad modes and final-component symlinks w
   assert.equal((await lstat(created)).mode & 0o7777, 0o700);
 });
 
+test("every selected browser profile keeps the private mode and symlink safeguards", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-selected-profiles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  for (const browser of ["firefox", "chrome", "edge"]) {
+    const created = path.join(root, `${browser}-created`);
+    assert.equal(await ensureProfileDir({ browser, profileDir: created }), created);
+    const createdStat = await lstat(created);
+    assert.equal(createdStat.mode & 0o7777, 0o700);
+    if (typeof process.getuid === "function") assert.equal(createdStat.uid, process.getuid());
+
+    const broad = path.join(root, `${browser}-broad`);
+    await mkdir(broad, { mode: 0o755 });
+    await chmod(broad, 0o755);
+    await assert.rejects(() => ensureProfileDir({ browser, profileDir: broad }), /private mode 0700/);
+    assert.equal((await lstat(broad)).mode & 0o7777, 0o755);
+
+    const real = path.join(root, `${browser}-real`);
+    const link = path.join(root, `${browser}-link`);
+    await mkdir(real, { mode: 0o700 });
+    await symlink(real, link);
+    await assert.rejects(() => ensureProfileDir({ browser, profileDir: link }), /final-component symlink/);
+  }
+});
+
 test("member probe interpretation only accepts a clean authenticated member object", () => {
   const base = { status: 200, jsonObject: true, errorsClear: true, hasMember: true, memberState: "object" };
   assert.equal(interpretMemberProbe(base), true);
@@ -179,6 +422,9 @@ test("member probe interpretation only accepts a clean authenticated member obje
   assert.equal(interpretMemberProbe({ ...base, errorsClear: false }), false);
   assert.equal(interpretMemberProbe({ ...base, hasMember: false, memberState: "missing" }), false);
   assert.equal(interpretMemberProbe(null), false);
+  assert.equal(interpretAnonymousMemberProbe({ ...base, memberState: "null" }), true);
+  assert.equal(interpretAnonymousMemberProbe({ ...base, status: 403, memberState: "null" }), false);
+  assert.equal(interpretAnonymousMemberProbe({ ...base, memberState: "other" }), false);
 });
 
 test("live member verification requires an authenticated account session", async () => {
@@ -220,6 +466,203 @@ test("live member verification requires an authenticated account session", async
     () => verifyAuthenticatedMember(page, memberRequest, listUrl),
     /Mijn lijst page is unavailable or denied.*no cart action was attempted/,
   );
+});
+
+test("confirmed apply uses the authenticated fast path in one guarded persistent context", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-fast-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fake = fakeApplyBrowser({ mainMember: ["object"] });
+  let launchProfile;
+  let launchOptions;
+  const launch = t.mock.method(firefox, "launchPersistentContext", async (profile, options) => {
+    launchProfile = profile;
+    launchOptions = options;
+    fake.events.push("persistent-launch");
+    return fake.context;
+  });
+  const statuses = [];
+  const result = await applyBasketInVisibleBrowser(actionableBasket(), {
+    profileDir: path.join(root, "profile"),
+    onStatus: (state) => statuses.push(state),
+  });
+
+  assert.equal(launch.mock.calls.length, 1);
+  assert.equal(launchProfile, path.join(root, "profile"));
+  assert.equal(launchOptions.channel, "moz-firefox");
+  assert.equal(result.context, fake.context);
+  assert.equal(result.page, fake.main);
+  assert.equal(fake.probeCount, 0);
+  assert.deepEqual(statuses, ["authenticated"]);
+  assert.ok(fake.events.indexOf("member:main") < fake.events.indexOf("guard-installed"));
+  assert.ok(fake.events.indexOf("guard-installed") < fake.events.lastIndexOf("member:main"));
+  assert.ok(fake.events.lastIndexOf("member:main") < fake.events.indexOf("graphql-read"));
+  assert.equal(fake.mutations.length, 1);
+  assert.deepEqual(
+    fake.mutations[0].items,
+    actionableBasket().items.map((item) => ({ id: Number(item.selected.product_id.slice(2)), quantity: item.quantity })),
+  );
+  assert.equal(result.receipt.complete, true);
+  await closeVisibleAhBrowser(result.context);
+});
+
+test("clean anonymous Chrome apply logs in through one context, freshly proves Mijn lijst, and resumes one plan", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-login-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fake = fakeApplyBrowser({
+    mainMember: ["null", "object"],
+    probeMember: ["null", "object"],
+    loginRedirect: "https://login.example/interactive-flow",
+  });
+  let launchProfile;
+  let launchOptions;
+  const launch = t.mock.method(chromium, "launchPersistentContext", async (profile, options) => {
+    launchProfile = profile;
+    launchOptions = options;
+    fake.events.push("persistent-launch");
+    return fake.context;
+  });
+  const statuses = [];
+  const result = await applyBasketInVisibleBrowser(actionableBasket(), {
+    browser: "chrome",
+    profileDir: path.join(root, "profile"),
+    onStatus: (state) => statuses.push(state),
+    loginPollMs: 0,
+    loginTimeoutMs: 1_000,
+  });
+
+  assert.equal(launch.mock.calls.length, 1);
+  assert.equal(launchProfile, path.join(root, "profile"));
+  assert.equal(launchOptions.channel, "chrome");
+  assert.equal(Object.hasOwn(launchOptions, "firefoxUserPrefs"), false);
+  assert.equal(result.context, fake.context);
+  assert.equal(result.page, fake.main);
+  assert.equal(fake.context.pages().length, 1);
+  assert.equal(fake.probeCount, 1);
+  assert.deepEqual(statuses, ["login-required", "waiting", "authenticated"]);
+  assert.ok(fake.events.includes("close:probe"));
+  assert.ok(fake.events.includes("front:main"));
+  const probeClosed = fake.events.indexOf("close:probe");
+  const freshListProof = fake.events.lastIndexOf("goto:main:https://www.ah.be/mijnlijst");
+  const freshMemberProof = fake.events.lastIndexOf("member:main");
+  const firstBasketRead = fake.events.indexOf("graphql-read");
+  assert.ok(probeClosed < freshMemberProof);
+  assert.ok(probeClosed < fake.events.indexOf("guard-installed"));
+  assert.ok(fake.events.indexOf("guard-installed") < freshListProof);
+  assert.ok(freshListProof < freshMemberProof);
+  assert.ok(fake.events.indexOf("guard-installed") < freshMemberProof);
+  assert.ok(freshMemberProof < firstBasketRead);
+  assert.equal(fake.mutations.length, 1);
+  assert.deepEqual(
+    fake.mutations[0].items,
+    actionableBasket().items.map((item) => ({ id: Number(item.selected.product_id.slice(2)), quantity: item.quantity })),
+  );
+  await closeVisibleAhBrowser(result.context);
+});
+
+test("Access Denied and unknown member state never enter interactive login", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-denied-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const denied = fakeApplyBrowser({ denied: true, mainMember: ["null"] });
+  const unknown = fakeApplyBrowser({ mainMember: ["unknown"] });
+  const fakes = [denied, unknown];
+  const launch = t.mock.method(firefox, "launchPersistentContext", async () => {
+    const fake = fakes.shift();
+    fake.events.push("persistent-launch");
+    return fake.context;
+  });
+
+  await assert.rejects(
+    () => applyBasketInVisibleBrowser(actionableBasket(), { profileDir: path.join(root, "denied") }),
+    /unavailable or denied.*no cart action was attempted/,
+  );
+  await closeVisibleAhBrowser(denied.context);
+  await assert.rejects(
+    () => applyBasketInVisibleBrowser(actionableBasket(), { profileDir: path.join(root, "unknown") }),
+    /member state could not be verified.*no cart action was attempted/,
+  );
+  await closeVisibleAhBrowser(unknown.context);
+
+  assert.equal(launch.mock.calls.length, 2);
+  for (const fake of [denied, unknown]) {
+    assert.equal(fake.probeCount, 0);
+    assert.ok(!fake.events.includes("graphql-read"));
+    assert.ok(!fake.events.some((event) => event.startsWith("mutation:")));
+  }
+});
+
+test("login timeout and login-window closure fail before adapter activity or mutation", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-login-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const timeout = fakeApplyBrowser({ mainMember: ["null"], probeMember: ["null"] });
+  const closed = fakeApplyBrowser({ mainMember: ["null"], closeLoginOnFront: true });
+  const fakes = [timeout, closed];
+  const launch = t.mock.method(firefox, "launchPersistentContext", async () => {
+    const fake = fakes.shift();
+    fake.events.push("persistent-launch");
+    return fake.context;
+  });
+
+  await assert.rejects(
+    () =>
+      applyBasketInVisibleBrowser(actionableBasket(), {
+        profileDir: path.join(root, "timeout"),
+        loginTimeoutMs: 0,
+        loginPollMs: 0,
+      }),
+    /Login was not completed in time/,
+  );
+  await closeVisibleAhBrowser(timeout.context);
+  await assert.rejects(
+    () => applyBasketInVisibleBrowser(actionableBasket(), { profileDir: path.join(root, "closed") }),
+    /dedicated AH login window was closed/,
+  );
+  await closeVisibleAhBrowser(closed.context);
+
+  assert.equal(launch.mock.calls.length, 2);
+  assert.equal(timeout.probeCount, 1);
+  assert.ok(timeout.events.includes("close:probe"));
+  for (const fake of [timeout, closed]) {
+    assert.ok(!fake.events.includes("graphql-read"));
+    assert.ok(!fake.events.some((event) => event.startsWith("mutation:")));
+  }
+});
+
+test("standalone login tolerates transient unproven polls but never retries an explicit denial", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-login-compatibility-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const transient = fakeApplyBrowser({ probeMember: ["error", "unknown", "object"] });
+  const denied = fakeApplyBrowser({ probeMember: ["denied", "object"] });
+  const fakes = [transient, denied];
+  const launch = t.mock.method(firefox, "launchPersistentContext", async () => {
+    const fake = fakes.shift();
+    fake.events.push("persistent-launch");
+    return fake.context;
+  });
+  const statuses = [];
+
+  const result = await runInteractiveLogin({
+    profileDir: path.join(root, "transient"),
+    pollMs: 0,
+    timeoutMs: 1_000,
+    onStatus: (state) => statuses.push(state),
+  });
+  assert.equal(result.context, transient.context);
+  assert.deepEqual(statuses, ["waiting", "authenticated"]);
+  assert.equal(transient.events.filter((event) => event === "member:probe").length, 3);
+  await closeVisibleAhBrowser(result.context);
+
+  await assert.rejects(
+    () =>
+      runInteractiveLogin({
+        profileDir: path.join(root, "denied"),
+        pollMs: 0,
+        timeoutMs: 1_000,
+      }),
+    /denied the login session.*rather than retrying automatically/i,
+  );
+  assert.equal(denied.events.filter((event) => event === "member:probe").length, 1);
+  assert.equal(denied.contextClosed, true);
+  assert.equal(launch.mock.calls.length, 2);
 });
 
 test("verified receipt accounting stays distinct when browser handoff cleanup fails", () => {

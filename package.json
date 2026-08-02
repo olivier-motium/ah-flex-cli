@@ -9,7 +9,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/cli.js"
+    "check": "node --check src/cli.js",
+    "test:e2e:browsers": "AH_FLEX_BROWSER_E2E=1 node --test test/browser-e2e.test.js"
   },
   "engines": {
     "node": ">=20"
