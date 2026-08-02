@@ -31,9 +31,11 @@ touches payment.
   target is created once with `0700` and its effective mode is verified.
   Existing symlinks, non-directories, wrong-owner targets, and broader modes
   are rejected without chmodding them. The CLI reuses that same profile for
-  every run. Authenticate it either through the visible one-time `session
-  login` flow or with the explicit macOS-only `session import-firefox` command
-  below.
+  every run. A confirmed apply uses the existing session immediately; if AH
+  says the profile is cleanly anonymous, it opens login in that same dedicated
+  window and resumes the reviewed apply automatically. `session login` is an
+  optional setup/repair command, and `session import-firefox` remains an
+  explicit macOS-only alternative below.
 - Password entry and verification codes stay outside the CLI. The optional
   importer transfers only rows scoped to `ah.be` and its
   subdomains between two closed local Firefox cookie databases. Cookie names
@@ -98,7 +100,7 @@ ah-flex template --brief "chicken and beef next week"
 ah-flex basket check basket.json [--json]
 ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
-ah-flex session login
+ah-flex session login                         # optional setup/repair
 ah-flex session status
 ah-flex session import-firefox "/path/to/firefox/profile" --confirm-ah-cookie-copy [--json]
 ah-flex cart apply basket.json                 # dry-run
@@ -109,10 +111,16 @@ ah-flex cart apply basket.json --confirm-add
 `--transport browser` reads through the trusted profile as a diagnostic
 fallback. Neither transport retries automatically after an Access Denied.
 
-`session login` opens the dedicated profile on ah.be and waits until the pinned
-member query proves the account session is active, then closes the browser.
-`session status` additionally proves that `/mijnlijst` is usable and not denied;
-it exits non-zero unless both checks make the session ready for cart apply.
+`session login` is an optional setup/repair command: it opens the dedicated
+profile on ah.be and waits until the pinned member query proves the account
+session is active, then closes the browser. A normal confirmed apply does not
+require it first. If AH has expired the saved session, the confirmed command
+opens login in the dedicated AH window and resumes that same reviewed apply
+automatically. If AH emails a login link, open or paste it in that dedicated
+window so the session lands in the reusable profile rather than your everyday
+browser. `session status` additionally proves that `/mijnlijst` is usable and
+not denied; it exits non-zero unless both checks make the session ready for cart
+apply.
 
 On macOS, `session import-firefox` can reuse an AH login from another local
 Firefox profile without ever automating that everyday profile. Quit Firefox
@@ -157,8 +165,9 @@ continue to login, ordering, or payment.
    `topped-up`; a line observed above the requested quantity before dispatch is
    left untouched and reported `kept-higher`. Confirmed commands
    require an interactive terminal so the final browser handoff cannot
-   disappear into a background job. If the saved session has expired, the CLI
-   stops before any click and asks for one `ah-flex session login`.
+   disappear into a background job. If AH has expired the saved session, the
+   command asks you to log in in the dedicated AH window and resumes this same
+   reviewed apply automatically. A separate `session login` is optional.
 
 The checked-in chicken-and-beef example is intentionally unresolved: it is the
 recombinable component brief, not fake or stale product data.
@@ -187,7 +196,9 @@ action.
 The authenticated write/readback canary passed on 2026-08-01: 10 missing exact
 lines were added in one batch, 26 existing exact lines were preserved, and
 36 products / 42 packs were verified by fresh GraphQL and reloaded DOM
-readbacks. No checkout or ordering page was opened.
+readbacks. No checkout or ordering page was opened. The anonymous-to-login
+same-command continuation is covered locally; its first clean-profile live run
+has not yet been repeated against AH.
 
 ## Session boundary
 

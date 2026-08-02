@@ -601,9 +601,46 @@ export function interpretMemberProbe(result) {
   );
 }
 
+export function interpretAnonymousMemberProbe(result) {
+  return Boolean(
+    result &&
+      result.status === 200 &&
+      result.jsonObject &&
+      result.errorsClear &&
+      result.hasMember &&
+      result.memberState === "null",
+  );
+}
+
+function isExactMijnlijstPage(page) {
+  try {
+    const url = new URL(page.url());
+    return url.origin === AH_ORIGIN && url.pathname === "/mijnlijst";
+  } catch {
+    return false;
+  }
+}
+
+async function classifyApplySession(page, memberRequest, targetUrl) {
+  await safeGoto(page, assertAllowedAutomationUrl(targetUrl));
+  if (await readAccessDenied(page)) {
+    throw new BasketError("The AH Mijn lijst page is unavailable or denied; no cart action was attempted");
+  }
+
+  const result = await probeMemberState(page, memberRequest);
+  if (interpretMemberProbe(result)) {
+    if (!isExactMijnlijstPage(page)) {
+      throw new BasketError("The AH Mijn lijst page is unavailable or denied; no cart action was attempted");
+    }
+    return "authenticated";
+  }
+  if (interpretAnonymousMemberProbe(result)) return "anonymous";
+  throw new BasketError("The live AH member state could not be verified; no cart action was attempted");
+}
+
 export async function verifyAuthenticatedMember(page, memberRequest, targetUrl) {
   await safeGoto(page, assertAllowedAutomationUrl(targetUrl));
-  if (new URL(page.url()).pathname !== "/mijnlijst" || (await readAccessDenied(page))) {
+  if (!isExactMijnlijstPage(page) || (await readAccessDenied(page))) {
     throw new BasketError("The AH Mijn lijst page is unavailable or denied; no cart action was attempted");
   }
   const result = await probeMemberState(page, memberRequest);
@@ -937,71 +974,99 @@ export async function readVisibleListStates(page, lines) {
   return normalizeVisibleListRows(rawRows, lines);
 }
 
-async function ensureAhOriginPage(page) {
-  let onAh = false;
-  try {
-    onAh = new URL(page.url()).origin === AH_ORIGIN;
-  } catch {
-    onAh = false;
+function assertInteractiveLoginWindowOpen(context, page, probe = null) {
+  if (typeof page?.isClosed === "function" && page.isClosed()) {
+    throw new BasketError(
+      "The dedicated AH login window was closed before the session became active; no cart action was attempted",
+    );
   }
-  if (!onAh) {
-    await page.goto(`${AH_ORIGIN}/`, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
+  if (typeof probe?.isClosed === "function" && probe.isClosed()) {
+    throw new BasketError(
+      "The AH login probe page was closed before the session became active; no cart action was attempted",
+    );
+  }
+  try {
+    context.pages();
+  } catch {
+    throw new BasketError("The dedicated AH browser closed before the session became active; no cart action was attempted");
   }
 }
 
-const LOGIN_LANDING_HTML = `<!doctype html>
-<meta charset="utf-8">
-<title>ah-flex login window</title>
-<body style="font-family:system-ui,-apple-system,sans-serif;background:#00a0e4;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-<div style="max-width:660px;text-align:center;padding:24px">
-<h1 style="font-size:34px;margin:0 0 16px">This is the ah-flex window</h1>
-<p style="font-size:20px;line-height:1.5">Your everyday Firefox login does <b>not</b> count here. This dedicated profile needs its own active AH account session.</p>
-<p style="margin:32px 0"><a href="https://www.ah.be/inloggen" style="display:inline-block;background:#fff;color:#00a0e4;font-size:24px;padding:16px 36px;border-radius:10px;text-decoration:none;font-weight:700">Open ah.be login &rarr;</a></p>
-<p style="font-size:16px;line-height:1.5;background:rgba(0,0,0,.18);border-radius:10px;padding:14px 18px">If AH emails you a login link or code: <b>copy the link and paste it into THIS window's address bar</b> (or type the code here). Clicking the link in your mail opens your everyday browser and the login lands there instead.</p>
-<p style="font-size:14px;opacity:.85">ah-flex watches until the account session is active, then closes this window. It never sees your credentials.</p>
-</div>`;
+async function bringLoginPageToFront(page) {
+  if (typeof page?.bringToFront !== "function") return;
+  try {
+    await page.bringToFront();
+  } catch {
+    throw new BasketError(
+      "The dedicated AH login window was closed before the session became active; no cart action was attempted",
+    );
+  }
+}
 
-export async function runInteractiveLogin(options = {}) {
-  const context = await launchAhProfileContext({ ...options, guarded: false });
-  const memberRequest = createMemberRequest();
+async function closeProbePage(probe) {
+  if (!probe || (typeof probe.isClosed === "function" && probe.isClosed())) return;
+  await probe.close().catch(() => {});
+}
+
+export async function completeInteractiveLogin(context, options = {}) {
+  const memberRequest = options.memberRequest ?? createMemberRequest();
   const timeoutMs = options.timeoutMs ?? LOGIN_TIMEOUT_MS;
   const pollMs = options.pollMs ?? LOGIN_POLL_MS;
   const deadline = Date.now() + timeoutMs;
+  const page = options.page ?? (await activePage(context));
+  let probe = null;
+  let announced = false;
   try {
-    const page = await activePage(context);
-    await page
-      .goto(`data:text/html;charset=utf-8,${encodeURIComponent(LOGIN_LANDING_HTML)}`, {
-        waitUntil: "domcontentloaded",
-        timeout: 15_000,
-      })
-      .catch(() => {});
-    let probe = await context.newPage();
-    let announced = false;
+    assertInteractiveLoginWindowOpen(context, page);
+    try {
+      await page.goto(`${AH_ORIGIN}/inloggen`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    } catch {
+      throw new BasketError("The AH login page could not be opened; no cart action was attempted");
+    }
+    await bringLoginPageToFront(page);
+    probe = await context.newPage();
+    assertInteractiveLoginWindowOpen(context, page, probe);
+    await safeGoto(probe, `${AH_ORIGIN}/`);
+    await bringLoginPageToFront(page);
+
     for (;;) {
-      if (probe.isClosed()) {
-        probe = await context.newPage().catch(() => null);
-        if (!probe) {
-          throw new BasketError(
-            "The login window was closed before the session became active; run 'ah-flex session login' again to continue",
-          );
-        }
-      }
-      await ensureAhOriginPage(probe);
+      assertInteractiveLoginWindowOpen(context, page, probe);
       const result = await probeMemberState(probe, memberRequest).catch(() => null);
       if (interpretMemberProbe(result)) {
-        return { context, page };
+        await closeProbePage(probe);
+        probe = null;
+        assertInteractiveLoginWindowOpen(context, page);
+        await bringLoginPageToFront(page);
+        options.onStatus?.("authenticated");
+        return { page };
+      }
+      if (result?.status === 403 || (await readAccessDenied(probe))) {
+        throw new BasketError(
+          "AH denied the login session. Stop rather than retrying automatically; try again later. No cart action was attempted",
+        );
       }
       if (Date.now() >= deadline) {
         throw new BasketError(
-          "Login was not completed in time. The dedicated profile keeps whatever was done; run 'ah-flex session login' again to finish",
+          "Login was not completed in time. The dedicated profile keeps whatever was done; no cart action was attempted",
         );
       }
       if (!announced) {
         announced = true;
         options.onStatus?.("waiting");
       }
+      await bringLoginPageToFront(page);
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
+  } finally {
+    await closeProbePage(probe);
+  }
+}
+
+export async function runInteractiveLogin(options = {}) {
+  const context = await launchAhProfileContext({ ...options, guarded: false });
+  try {
+    const result = await completeInteractiveLogin(context, options);
+    return { context, page: result.page };
   } catch (error) {
     await context.close().catch(() => {});
     throw error;
@@ -1069,20 +1134,37 @@ export async function sessionStatus(options = {}) {
 
 export async function applyBasketInVisibleBrowser(basket, options = {}) {
   const plan = buildApplyPlan(basket, options);
-  const context = await launchAhProfileContext(options);
+  const context = await launchAhProfileContext({ ...options, guarded: false });
   let page = null;
   let verifiedReceipt = null;
   try {
     page = await activePage(context);
+    const memberRequest = createMemberRequest();
+    const session = await classifyApplySession(page, memberRequest, plan.target);
+    if (session === "anonymous") {
+      options.onStatus?.("login-required");
+      const login = await completeInteractiveLogin(context, {
+        page,
+        memberRequest,
+        timeoutMs: options.loginTimeoutMs,
+        pollMs: options.loginPollMs,
+        onStatus: options.onStatus,
+      });
+      page = login.page;
+    } else {
+      options.onStatus?.("authenticated");
+    }
+
+    await installNavigationGuard(context);
+    await verifyAuthenticatedMember(page, memberRequest, plan.target);
     const adapter = createBasketGraphqlAdapter(page, plan.lines);
-    await verifyAuthenticatedMember(page, createMemberRequest(), plan.target);
     const privacy = await ensureNecessaryCookiePreference(page);
     const receipt = await applyBasketWithAdapter(basket, adapter, options);
     if (privacy.changed) {
       receipt.warnings.unshift("AH privacy prompt declined optional cookies; necessary cookies only.");
     }
     verifiedReceipt = receipt;
-    if (new URL(page.url()).pathname !== "/mijnlijst") {
+    if (!isExactMijnlijstPage(page)) {
       await safeGoto(page, `${AH_ORIGIN}/mijnlijst`);
     }
     await releaseAutomationGuard(context);

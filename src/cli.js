@@ -43,12 +43,15 @@ Usage:
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Confirmed writes stay
   on authenticated /mijnlijst and use its pinned same-origin basket operations
-  through one dedicated persistent Firefox profile. Authenticate it with 'session
-  login', or optionally copy only AH Belgium cookie rows from a closed Firefox
-  profile with the macOS-only 'session import-firefox'. Every later run reuses
-  that session. The live member query must prove the authenticated account
-  before any basket mutation. Mutations are never retried automatically. Do not
-  edit the same basket in another tab or device while confirmed apply is running.
+  through one dedicated persistent Firefox profile. A confirmed apply continues
+  immediately when that profile is authenticated; otherwise it opens login in
+  that same dedicated AH window and resumes this reviewed apply automatically.
+  'session login' is an optional setup or repair command. You may also copy only
+  AH Belgium cookie rows from a closed Firefox profile with the macOS-only
+  'session import-firefox'. Every later run reuses that session. The live member
+  query must prove the authenticated account before any basket mutation.
+  Mutations are never retried automatically. Do not edit the same basket in
+  another tab or device while confirmed apply is running.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
   session); --transport browser reads through the same trusted profile.
   Checkout, ordering, payment, substitutions, and implicit product selection do
@@ -215,7 +218,7 @@ async function handleSession(args) {
     if (status.state === "authenticated") {
       console.log("AH session is authenticated; 'cart apply --confirm-add' can use it.");
     } else if (status.state === "anonymous") {
-      console.log("AH session is not authenticated. Run 'ah-flex session login' once in the dedicated profile.");
+      console.log("AH session is not authenticated. 'session login' is optional setup/repair; confirmed apply can open login in that dedicated profile.");
     } else if (status.state === "denied") {
       console.log("AH denied the dedicated browser profile. Try again later; run 'ah-flex session login' if it persists.");
     } else {
@@ -229,8 +232,9 @@ async function handleSession(args) {
   if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
   console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
   console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
-  console.log("A dedicated Firefox window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported).");
+  console.log("A dedicated Firefox window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported). This command is optional setup or repair for future confirmed applies.");
   console.log("Log in IN THAT NEW WINDOW — logging into your everyday Firefox does not count. ah-flex never sees your credentials.");
+  console.log("If AH emails a login link, open or paste it in that dedicated window instead of your everyday browser.");
   const { context } = await runInteractiveLogin({
     onStatus: (state) => {
       if (state === "waiting") console.log("Waiting for the AH account session to become active…");
@@ -265,8 +269,24 @@ async function handleCart(args) {
 
   let context = null;
   let operationError = null;
+  let loginRequested = false;
+  const reportProgress = (state) => {
+    const message =
+      state === "login-required"
+        ? "No active AH session was proved. Log in in the dedicated AH Firefox window; if AH emails a link, open or paste it there. This same reviewed apply will resume automatically."
+        : state === "waiting"
+          ? "Waiting for login in the dedicated AH Firefox window…"
+          : state === "authenticated" && loginRequested
+            ? "Login succeeded in the dedicated AH window; resuming the same reviewed apply."
+            : state === "authenticated"
+              ? "Using the existing authenticated AH session."
+              : null;
+    if (!message) return;
+    if (state === "login-required") loginRequested = true;
+    (asJson ? console.error : console.log)(message);
+  };
   try {
-    const result = await applyBasketInVisibleBrowser(basket);
+    const result = await applyBasketInVisibleBrowser(basket, { onStatus: reportProgress });
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {
