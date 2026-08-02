@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { firefox } from "playwright-core";
+import { chromium, firefox } from "playwright-core";
 import {
+  BROWSER_REGISTRY,
   applyBasketWithAdapter,
   applyBasketInVisibleBrowser,
   attachVerifiedReceipt,
@@ -19,9 +20,11 @@ import {
   isAllowedAutomationUrl,
   normalizeProductCandidate,
   normalizeVisibleListRows,
+  resolveBrowser,
   resolveProfileDir,
   runInteractiveLogin,
   verifyAuthenticatedMember,
+  visibleChromiumLaunchOptions,
   visibleFirefoxLaunchOptions,
 } from "../src/browser.js";
 import { BasketError } from "../src/basket.js";
@@ -258,6 +261,60 @@ test("visible browser uses stock Firefox in non-headless mode with a quiet dedic
   assert.equal(options.firefoxUserPrefs["browser.shell.checkDefaultBrowser"], false);
 });
 
+test("browser registry exposes the exact supported names, channels, labels, and profile leaves", () => {
+  assert.deepEqual(Object.keys(BROWSER_REGISTRY), ["firefox", "chrome", "edge"]);
+  assert.equal(resolveBrowser(), BROWSER_REGISTRY.firefox);
+  assert.equal(resolveProfileDir(), path.join(os.homedir(), ".ah-flex", "firefox-profile"));
+  assert.equal(resolveProfileDir({ browser: "firefox" }), path.join(os.homedir(), ".ah-flex", "firefox-profile"));
+
+  const expected = {
+    firefox: { label: "Firefox", channel: "moz-firefox", profile: "firefox-profile", browserType: firefox },
+    chrome: { label: "Google Chrome", channel: "chrome", profile: "chrome-profile", browserType: chromium },
+    edge: { label: "Microsoft Edge", channel: "msedge", profile: "edge-profile", browserType: chromium },
+  };
+  for (const [name, facts] of Object.entries(expected)) {
+    const browser = resolveBrowser(name);
+    assert.equal(browser.name, name);
+    assert.equal(browser.label, facts.label);
+    assert.equal(browser.channel, facts.channel);
+    assert.equal(browser.browserType, facts.browserType);
+    assert.equal(browser.profileDir, path.join(".ah-flex", facts.profile));
+    assert.equal(resolveProfileDir({ browser: name }), path.join(os.homedir(), ".ah-flex", facts.profile));
+  }
+});
+
+test("Chromium launch options are visible and contain no Firefox preferences", () => {
+  assert.deepEqual(visibleChromiumLaunchOptions("chrome"), {
+    channel: "chrome",
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
+  });
+  assert.deepEqual(BROWSER_REGISTRY.edge.launchOptions(), {
+    channel: "msedge",
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
+  });
+  assert.equal(Object.hasOwn(visibleChromiumLaunchOptions("chrome"), "firefoxUserPrefs"), false);
+  assert.equal(Object.hasOwn(BROWSER_REGISTRY.edge.launchOptions(), "firefoxUserPrefs"), false);
+});
+
+test("Safari, WebKit, and unknown browsers reject before a profile can be created", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-browser-rejections-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.throws(() => resolveBrowser("safari"), /Safari is not supported.*Playwright WebKit is not Safari/);
+  assert.throws(() => resolveBrowser("webkit"), /WebKit is not supported.*not Safari/);
+  assert.throws(() => resolveBrowser("opera"), /Unknown browser 'opera'.*firefox, chrome, edge/);
+
+  for (const name of ["safari", "webkit", "opera"]) {
+    const profile = path.join(root, `${name}-profile`);
+    await assert.rejects(() => ensureProfileDir({ browser: name, profileDir: profile }));
+    await assert.rejects(lstat(profile), (error) => error?.code === "ENOENT");
+  }
+});
+
 test("the trusted profile fails closed if the consent UI reappears", async () => {
   const page = { locator: () => ({ isVisible: async () => false }) };
   await assertCookiePopupAbsent(page);
@@ -332,6 +389,31 @@ test("profile launch boundary rejects broad modes and final-component symlinks w
   assert.equal((await lstat(created)).mode & 0o7777, 0o700);
 });
 
+test("every selected browser profile keeps the private mode and symlink safeguards", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-selected-profiles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  for (const browser of ["firefox", "chrome", "edge"]) {
+    const created = path.join(root, `${browser}-created`);
+    assert.equal(await ensureProfileDir({ browser, profileDir: created }), created);
+    const createdStat = await lstat(created);
+    assert.equal(createdStat.mode & 0o7777, 0o700);
+    if (typeof process.getuid === "function") assert.equal(createdStat.uid, process.getuid());
+
+    const broad = path.join(root, `${browser}-broad`);
+    await mkdir(broad, { mode: 0o755 });
+    await chmod(broad, 0o755);
+    await assert.rejects(() => ensureProfileDir({ browser, profileDir: broad }), /private mode 0700/);
+    assert.equal((await lstat(broad)).mode & 0o7777, 0o755);
+
+    const real = path.join(root, `${browser}-real`);
+    const link = path.join(root, `${browser}-link`);
+    await mkdir(real, { mode: 0o700 });
+    await symlink(real, link);
+    await assert.rejects(() => ensureProfileDir({ browser, profileDir: link }), /final-component symlink/);
+  }
+});
+
 test("member probe interpretation only accepts a clean authenticated member object", () => {
   const base = { status: 200, jsonObject: true, errorsClear: true, hasMember: true, memberState: "object" };
   assert.equal(interpretMemberProbe(base), true);
@@ -390,7 +472,11 @@ test("confirmed apply uses the authenticated fast path in one guarded persistent
   const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-fast-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const fake = fakeApplyBrowser({ mainMember: ["object"] });
-  const launch = t.mock.method(firefox, "launchPersistentContext", async () => {
+  let launchProfile;
+  let launchOptions;
+  const launch = t.mock.method(firefox, "launchPersistentContext", async (profile, options) => {
+    launchProfile = profile;
+    launchOptions = options;
     fake.events.push("persistent-launch");
     return fake.context;
   });
@@ -401,6 +487,8 @@ test("confirmed apply uses the authenticated fast path in one guarded persistent
   });
 
   assert.equal(launch.mock.calls.length, 1);
+  assert.equal(launchProfile, path.join(root, "profile"));
+  assert.equal(launchOptions.channel, "moz-firefox");
   assert.equal(result.context, fake.context);
   assert.equal(result.page, fake.main);
   assert.equal(fake.probeCount, 0);
@@ -417,7 +505,7 @@ test("confirmed apply uses the authenticated fast path in one guarded persistent
   await closeVisibleAhBrowser(result.context);
 });
 
-test("clean anonymous apply logs in through the same page, freshly proves Mijn lijst, and resumes one plan", async (t) => {
+test("clean anonymous Chrome apply logs in through one context, freshly proves Mijn lijst, and resumes one plan", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-apply-login-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const fake = fakeApplyBrowser({
@@ -425,12 +513,17 @@ test("clean anonymous apply logs in through the same page, freshly proves Mijn l
     probeMember: ["null", "object"],
     loginRedirect: "https://login.example/interactive-flow",
   });
-  const launch = t.mock.method(firefox, "launchPersistentContext", async () => {
+  let launchProfile;
+  let launchOptions;
+  const launch = t.mock.method(chromium, "launchPersistentContext", async (profile, options) => {
+    launchProfile = profile;
+    launchOptions = options;
     fake.events.push("persistent-launch");
     return fake.context;
   });
   const statuses = [];
   const result = await applyBasketInVisibleBrowser(actionableBasket(), {
+    browser: "chrome",
     profileDir: path.join(root, "profile"),
     onStatus: (state) => statuses.push(state),
     loginPollMs: 0,
@@ -438,17 +531,24 @@ test("clean anonymous apply logs in through the same page, freshly proves Mijn l
   });
 
   assert.equal(launch.mock.calls.length, 1);
+  assert.equal(launchProfile, path.join(root, "profile"));
+  assert.equal(launchOptions.channel, "chrome");
+  assert.equal(Object.hasOwn(launchOptions, "firefoxUserPrefs"), false);
   assert.equal(result.context, fake.context);
   assert.equal(result.page, fake.main);
+  assert.equal(fake.context.pages().length, 1);
   assert.equal(fake.probeCount, 1);
   assert.deepEqual(statuses, ["login-required", "waiting", "authenticated"]);
   assert.ok(fake.events.includes("close:probe"));
   assert.ok(fake.events.includes("front:main"));
   const probeClosed = fake.events.indexOf("close:probe");
+  const freshListProof = fake.events.lastIndexOf("goto:main:https://www.ah.be/mijnlijst");
   const freshMemberProof = fake.events.lastIndexOf("member:main");
   const firstBasketRead = fake.events.indexOf("graphql-read");
   assert.ok(probeClosed < freshMemberProof);
   assert.ok(probeClosed < fake.events.indexOf("guard-installed"));
+  assert.ok(fake.events.indexOf("guard-installed") < freshListProof);
+  assert.ok(freshListProof < freshMemberProof);
   assert.ok(fake.events.indexOf("guard-installed") < freshMemberProof);
   assert.ok(freshMemberProof < firstBasketRead);
   assert.equal(fake.mutations.length, 1);

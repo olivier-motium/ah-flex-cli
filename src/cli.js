@@ -17,6 +17,7 @@ import {
   applyBasketInVisibleBrowser,
   buildApplyPlan,
   closeVisibleAhBrowser,
+  resolveBrowser,
   runInteractiveLogin,
   sessionStatus,
 } from "./browser.js";
@@ -33,15 +34,15 @@ Usage:
   ah-flex schema
   ah-flex basket check <basket.json> [--json]
   ah-flex basket review <basket.json> --out <review.html> [--open]
-  ah-flex search <query> [--limit 8] [--transport http|browser] [--json]
-  ah-flex session login
-  ah-flex session status [--json]
-  ah-flex cart apply <basket.json> [--confirm-add] [--json]
+  ah-flex search <query> [--limit 8] [--transport http|browser] [--browser firefox|chrome|edge] [--json]
+  ah-flex session login [--browser firefox|chrome|edge]
+  ah-flex session status [--browser firefox|chrome|edge] [--json]
+  ah-flex cart apply <basket.json> [--browser firefox|chrome|edge] [--confirm-add] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Confirmed writes stay
   on authenticated /mijnlijst and use its pinned same-origin basket operations
-  through one dedicated persistent Firefox profile. A confirmed apply continues
+  through one dedicated persistent browser profile. A confirmed apply continues
   immediately when that profile is authenticated; otherwise it opens login in
   that same dedicated AH window and resumes this reviewed apply automatically.
   'session login' is an optional setup or repair command. Authentication stays
@@ -69,6 +70,14 @@ function takeFlag(args, name, { value = false, defaultValue } = {}) {
 
 function rejectUnknown(args) {
   if (args.length) throw new BasketError(`Unexpected argument(s): ${args.join(" ")}`);
+}
+
+function takeBrowserOption(args) {
+  const occurrences = args.filter((arg) => arg === "--browser").length;
+  if (occurrences > 1) throw new BasketError("--browser may be specified only once");
+  const name = takeFlag(args, "--browser", { value: true, defaultValue: "firefox" });
+  const browser = resolveBrowser(name);
+  return { name: browser.name, label: browser.label, specified: occurrences === 1 };
 }
 
 async function writeJson(filePath, value) {
@@ -161,6 +170,7 @@ async function handleSearch(args) {
   if (!query) throw new BasketError("search requires a query");
   const limitRaw = takeFlag(args, "--limit", { value: true, defaultValue: "8" });
   const transport = takeFlag(args, "--transport", { value: true, defaultValue: "http" });
+  const browser = takeBrowserOption(args);
   const asJson = takeFlag(args, "--json");
   rejectUnknown(args);
   const limit = Number(limitRaw);
@@ -170,7 +180,10 @@ async function handleSearch(args) {
   if (!TRANSPORTS.includes(transport)) {
     throw new BasketError(`--transport must be one of: ${TRANSPORTS.join(", ")}`);
   }
-  const products = await searchProducts(query, { limit, transport });
+  if (transport === "http" && browser.specified) {
+    throw new BasketError("--browser is only supported with --transport browser");
+  }
+  const products = await searchProducts(query, { limit, transport, browser: browser.name });
   if (asJson) {
     console.log(JSON.stringify(products, null, 2));
     return;
@@ -185,9 +198,10 @@ async function handleSearch(args) {
 async function handleSession(args) {
   const action = args.shift();
   const asJson = takeFlag(args, "--json");
+  const browser = takeBrowserOption(args);
   rejectUnknown(args);
   if (action === "status") {
-    const status = await sessionStatus();
+    const status = await sessionStatus({ browser: browser.name });
     if (asJson) {
       console.log(JSON.stringify(status, null, 2));
       if (status.state !== "authenticated") process.exitCode = 1;
@@ -208,12 +222,13 @@ async function handleSession(args) {
   if (action !== "login") throw new BasketError("Use 'session login' or 'session status'");
   if (asJson) throw new BasketError("session login does not support --json because it requires an interactive browser handoff");
   if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
-  console.log("Opening the dedicated ah-flex Firefox profile on ah.be.");
+  console.log(`Opening the dedicated ah-flex ${browser.label} profile on ah.be.`);
   console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
-  console.log("A dedicated Firefox window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported). This command is optional setup or repair for future confirmed applies.");
-  console.log("Log in IN THAT NEW WINDOW — logging into your everyday Firefox does not count. ah-flex never sees your credentials.");
+  console.log(`A dedicated ${browser.label} window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported). This command is optional setup or repair for future confirmed applies.`);
+  console.log("Log in IN THAT NEW WINDOW — logging into your everyday browser does not count. ah-flex never sees your credentials.");
   console.log("If AH emails a login link, open or paste it in that dedicated window instead of your everyday browser.");
   const { context } = await runInteractiveLogin({
+    browser: browser.name,
     onStatus: (state) => {
       if (state === "waiting") console.log("Waiting for the AH account session to become active…");
     },
@@ -229,6 +244,7 @@ async function handleCart(args) {
   if (action !== "apply" || !filePath) throw new BasketError("Use 'cart apply <basket.json>'");
   const confirmed = takeFlag(args, "--confirm-add");
   const asJson = takeFlag(args, "--json");
+  const browser = takeBrowserOption(args);
   rejectUnknown(args);
   const basket = await loadBasket(path.resolve(filePath));
   if (!confirmed) {
@@ -251,9 +267,9 @@ async function handleCart(args) {
   const reportProgress = (state) => {
     const message =
       state === "login-required"
-        ? "No active AH session was proved. Log in in the dedicated AH Firefox window; if AH emails a link, open or paste it there. This same reviewed apply will resume automatically."
+        ? `No active AH session was proved. Log in in the dedicated AH ${browser.label} window; if AH emails a link, open or paste it there. This same reviewed apply will resume automatically.`
         : state === "waiting"
-          ? "Waiting for login in the dedicated AH Firefox window…"
+          ? `Waiting for login in the dedicated AH ${browser.label} window…`
           : state === "authenticated" && loginRequested
             ? "Login succeeded in the dedicated AH window; resuming the same reviewed apply."
             : state === "authenticated"
@@ -264,7 +280,7 @@ async function handleCart(args) {
     (asJson ? console.error : console.log)(message);
   };
   try {
-    const result = await applyBasketInVisibleBrowser(basket, { onStatus: reportProgress });
+    const result = await applyBasketInVisibleBrowser(basket, { browser: browser.name, onStatus: reportProgress });
     context = result.context;
     if (asJson) console.log(JSON.stringify(result.receipt, null, 2));
     else {

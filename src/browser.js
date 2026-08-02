@@ -1,7 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { lstat, mkdir } from "node:fs/promises";
-import { firefox } from "playwright-core";
+import { chromium, firefox } from "playwright-core";
 import { assertActionableBasket, assertExactProductUrl, BasketError, calculateUnitPrice } from "./basket.js";
 import {
   BASKET_ITEMS_ADD_OPERATION,
@@ -33,8 +33,59 @@ const PRIVATE_PROFILE_MODE = 0o700;
 
 const navigationGuards = new WeakMap();
 
+export const BROWSER_REGISTRY = Object.freeze({
+  firefox: Object.freeze({
+    name: "firefox",
+    label: "Firefox",
+    browserType: firefox,
+    channel: "moz-firefox",
+    profileDir: DEFAULT_PROFILE_DIR,
+    launchOptions: visibleFirefoxLaunchOptions,
+  }),
+  chrome: Object.freeze({
+    name: "chrome",
+    label: "Google Chrome",
+    browserType: chromium,
+    channel: "chrome",
+    profileDir: path.join(".ah-flex", "chrome-profile"),
+    launchOptions: () => visibleChromiumLaunchOptions("chrome"),
+  }),
+  edge: Object.freeze({
+    name: "edge",
+    label: "Microsoft Edge",
+    browserType: chromium,
+    channel: "msedge",
+    profileDir: path.join(".ah-flex", "edge-profile"),
+    launchOptions: () => visibleChromiumLaunchOptions("msedge"),
+  }),
+});
+
+function supportedBrowserNames() {
+  return Object.keys(BROWSER_REGISTRY).join(", ");
+}
+
+export function resolveBrowser(value = "firefox") {
+  if (typeof value === "string" && Object.prototype.hasOwnProperty.call(BROWSER_REGISTRY, value)) {
+    return BROWSER_REGISTRY[value];
+  }
+
+  const lowerValue = typeof value === "string" ? value.toLowerCase() : "";
+  if (lowerValue === "safari") {
+    throw new BasketError(
+      "Safari is not supported: Safari WebDriver's isolated automation sessions cannot supply the reusable human-login profile, and Playwright WebKit is not Safari. Use firefox, chrome, or edge.",
+    );
+  }
+  if (lowerValue === "webkit") {
+    throw new BasketError(
+      "WebKit is not supported: Playwright WebKit is not Safari; WebKit is a patched test browser, not Safari or a supported daily browser. Use firefox, chrome, or edge.",
+    );
+  }
+  throw new BasketError(`Unknown browser '${String(value)}'. Supported values: ${supportedBrowserNames()}`);
+}
+
 export function resolveProfileDir(options = {}) {
-  const candidate = options.profileDir ?? path.join(os.homedir(), DEFAULT_PROFILE_DIR);
+  const browser = resolveBrowser(options.browser);
+  const candidate = options.profileDir ?? path.join(os.homedir(), browser.profileDir);
   if (typeof candidate !== "string" || !candidate.trim()) {
     throw new BasketError("The AH browser profile directory must be a non-empty path");
   }
@@ -475,8 +526,19 @@ async function installNavigationGuard(context) {
 }
 
 export async function launchAhProfileContext(options = {}) {
-  const profileDir = await ensureProfileDir(options);
-  const context = await firefox.launchPersistentContext(profileDir, visibleFirefoxLaunchOptions());
+  const browser = resolveBrowser(options.browser);
+  const profileDir = await ensureProfileDir({ ...options, browser: browser.name });
+  let context;
+  try {
+    context = await browser.browserType.launchPersistentContext(profileDir, browser.launchOptions());
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    const error = new BasketError(
+      `Could not launch ${browser.label} through the '${browser.channel}' browser channel. Ensure ${browser.label} is installed and available to Playwright, then try again. Original error: ${detail}`,
+    );
+    error.cause = cause;
+    throw error;
+  }
   try {
     if (options.guarded !== false) await installNavigationGuard(context);
     return context;
@@ -524,6 +586,15 @@ export function visibleFirefoxLaunchOptions() {
       "browser.shell.checkDefaultBrowser": false,
       "datareporting.policy.dataSubmissionEnabled": false,
     },
+  };
+}
+
+export function visibleChromiumLaunchOptions(channel = "chrome") {
+  return {
+    channel,
+    headless: false,
+    viewport: null,
+    acceptDownloads: false,
   };
 }
 

@@ -24,20 +24,28 @@ touches payment.
   pages, not from screen scraping. This default transport sends no cookies or
   stored session values. The optional browser diagnostic transport uses the
   dedicated persistent profile described below.
-- Browser writes use one fixed dedicated persistent Firefox profile owned by the
-  CLI at `~/.ah-flex/firefox-profile`; the CLI exposes no profile-directory
-  override. Before Firefox launches, the final path component must be a
-  current-user-owned directory with exactly private mode `0700`; a missing
-  target is created once with `0700` and its effective mode is verified.
-  Existing symlinks, non-directories, wrong-owner targets, and broader modes
-  are rejected without chmodding them. The CLI reuses that same profile for
-  every run. A confirmed apply uses the existing session immediately; if AH
-  says the profile is cleanly anonymous, it opens login in that same dedicated
-  window and resumes the reviewed apply automatically. `session login` is an
-  optional setup/repair command. Authentication stays in that browser-owned
-  profile, which every later run reuses; the CLI does not inspect or copy
-  browser cookie, token, or profile database data. Password entry and
-  verification codes stay outside the CLI.
+- Browser writes use one fixed dedicated persistent profile per supported browser,
+  selected with `--browser` and owned by the CLI:
+  `firefox` is Firefox through the `moz-firefox` channel at
+  `~/.ah-flex/firefox-profile`, `chrome` is Google Chrome through the `chrome`
+  channel at `~/.ah-flex/chrome-profile`, and `edge` is Microsoft Edge through
+  the `msedge` channel at `~/.ah-flex/edge-profile`. The unflagged default is
+  Firefox, preserving the original default path and behavior. The CLI exposes
+  no profile-directory override, fallback, browser discovery, config import, or
+  everyday-browser profile import. Before any selected browser launches, its
+  final path component must be a current-user-owned directory with exactly
+  private mode `0700`; a missing target is created once with `0700` and its
+  effective mode is verified. Existing symlinks, non-directories, wrong-owner
+  targets, and broader modes are rejected without chmodding them. Each selected
+  browser profile needs its own one-time visible login; profiles never share
+  cookies, tokens, or profile databases. A confirmed apply uses the existing
+  selected-browser session immediately; if AH says that profile is cleanly
+  anonymous, it opens login in that same dedicated window and resumes the
+  reviewed apply automatically. `session login` is an optional setup/repair
+  command. Authentication stays in the browser-owned profile, which every
+  later run reuses; the CLI does not inspect or copy browser cookie, token, or
+  profile database data. Password entry and verification codes stay outside the
+  CLI.
 - Cart/list changes are dry-run by default and require an explicit execution
   flag. Checkout and payment automation do not exist. Once exact line/quantity
   readback succeeds, browser control is released for the human handoff. If AH
@@ -75,7 +83,9 @@ or auto-substitution engine are part of the product.
 
 ## Install
 
-Requires Node.js 20+ and a current local Firefox installation.
+Requires Node.js 20+ and at least one current local installation of Firefox,
+Google Chrome, or Microsoft Edge. Firefox remains the default. Select Chrome or
+Edge explicitly with `--browser chrome` or `--browser edge`.
 
 ```sh
 npm install
@@ -83,10 +93,30 @@ npm link
 ah-flex --help
 ```
 
-Confirmed writes use stock Firefox through Playwright's WebDriver BiDi channel.
-All automation runs in the single dedicated persistent profile, so the site
-sees the same returning browser you logged into once — not a fresh throwaway
-profile on every run.
+The opt-in installed-browser lifecycle proof runs with:
+
+```sh
+npm run test:e2e:browsers
+```
+
+This command launches visible temporary Firefox, Google Chrome, and Microsoft
+Edge windows sequentially. Its automated page traffic is constrained to a
+`127.0.0.1` fixture; Playwright page routing is not an OS-level firewall for a
+browser's own background services. Passing proves installed-browser profile
+creation and localStorage persistence across a close/relaunch; it is not AH
+authentication proof or cart proof.
+
+Confirmed writes use the selected installed browser through Playwright's
+branded browser channel. All automation runs in that browser's dedicated
+persistent profile, so the site sees the same returning browser you logged into
+once — not a fresh throwaway profile on every run.
+
+Safari is deliberately not a selector. Safari WebDriver creates isolated
+automation sessions and cannot supply the reusable, browser-owned human-login
+profile this CLI requires. Playwright's WebKit build is a test browser, not
+Safari, so `--browser safari` and `--browser webkit` both fail with an explicit
+explanation instead of silently launching a substitute or changing Safari
+security settings.
 
 ## Command surface
 
@@ -94,27 +124,28 @@ profile on every run.
 ah-flex template --brief "chicken and beef next week"
 ah-flex basket check basket.json [--json]
 ah-flex basket review basket.json --out review.html [--open]
-ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
-ah-flex session login                         # optional setup/repair
-ah-flex session status
-ah-flex cart apply basket.json                 # dry-run
-ah-flex cart apply basket.json --confirm-add
+ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--browser firefox|chrome|edge] [--json]
+ah-flex session login [--browser firefox|chrome|edge]       # optional setup/repair
+ah-flex session status [--browser firefox|chrome|edge]
+ah-flex cart apply basket.json [--browser firefox|chrome|edge]                 # dry-run
+ah-flex cart apply basket.json --browser chrome --confirm-add
 ```
 
 `search` defaults to the HTTP transport, which needs no login and no browser.
 `--transport browser` reads through the trusted profile as a diagnostic
 fallback. Neither transport retries automatically after an Access Denied.
 
-`session login` is an optional setup/repair command: it opens the dedicated
-profile on ah.be and waits until the pinned member query proves the account
-session is active, then closes the browser. A normal confirmed apply does not
-require it first. If AH has expired the saved session, the confirmed command
-opens login in the dedicated AH window and resumes that same reviewed apply
-automatically. If AH emails a login link, open or paste it in that dedicated
-window so the session lands in the reusable profile rather than your everyday
-browser. `session status` additionally proves that `/mijnlijst` is usable and
-not denied; it exits non-zero unless both checks make the session ready for cart
-apply.
+`session login` is an optional setup/repair command: it opens the selected
+browser's dedicated profile on ah.be and waits until the pinned member query
+proves the account session is active, then closes the browser. A normal
+confirmed apply does not require it first. If AH has expired the selected
+profile's saved session, the confirmed command opens login in that same AH
+window and resumes that reviewed apply automatically. If AH emails a login
+link, open or paste it in that dedicated window so the session lands in the
+reusable profile rather than your everyday browser. Each browser has its own
+login; switching `--browser` does not copy session data. `session status`
+additionally proves that `/mijnlijst` is usable and not denied; it exits
+non-zero unless both checks make that selected profile ready for cart apply.
 
 Authentication is established only through the visible browser login in the
 dedicated profile. The CLI never sees credentials or session values.
@@ -160,7 +191,9 @@ recombinable component brief, not fake or stale product data.
 ## Current live boundary
 
 The data model, report, dry-run, URL guards, fact normalization, and
-write/readback orchestration have local test coverage. The live read canary
+write/readback orchestration have local test coverage. Firefox, Google Chrome,
+and Microsoft Edge branded-channel/profile lifecycle checks are available as a
+local opt-in E2E suite. The live read canary
 passed on 2026-07-31: `search` over the HTTP transport returned exact product
 URLs, prices, packs, and unit prices from `www.ah.be` after the Akamai edge
 had denied both curl and the automated browser profile on `/zoeken`. The
