@@ -34,15 +34,10 @@ touches payment.
   every run. A confirmed apply uses the existing session immediately; if AH
   says the profile is cleanly anonymous, it opens login in that same dedicated
   window and resumes the reviewed apply automatically. `session login` is an
-  optional setup/repair command, and `session import-firefox` remains an
-  explicit macOS-only alternative below.
-- Password entry and verification codes stay outside the CLI. The optional
-  importer transfers only rows scoped to `ah.be` and its
-  subdomains between two closed local Firefox cookie databases. Cookie names
-  and values remain opaque SQLite data: they are never printed, exported to an
-  intermediary file, included in receipts, tests, or Git, or accepted on the
-  command line. No history, passwords, local storage, preferences, bookmarks,
-  extensions, or unrelated cookies are copied.
+  optional setup/repair command. Authentication stays in that browser-owned
+  profile, which every later run reuses; the CLI does not inspect or copy
+  browser cookie, token, or profile database data. Password entry and
+  verification codes stay outside the CLI.
 - Cart/list changes are dry-run by default and require an explicit execution
   flag. Checkout and payment automation do not exist. Once exact line/quantity
   readback succeeds, browser control is released for the human handoff. If AH
@@ -102,7 +97,6 @@ ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" --limit 8 [--transport http|browser] [--json]
 ah-flex session login                         # optional setup/repair
 ah-flex session status
-ah-flex session import-firefox "/path/to/firefox/profile" --confirm-ah-cookie-copy [--json]
 ah-flex cart apply basket.json                 # dry-run
 ah-flex cart apply basket.json --confirm-add
 ```
@@ -122,19 +116,10 @@ browser. `session status` additionally proves that `/mijnlijst` is usable and
 not denied; it exits non-zero unless both checks make the session ready for cart
 apply.
 
-On macOS, `session import-firefox` can reuse an AH login from another local
-Firefox profile without ever automating that everyday profile. Quit Firefox
-first so both the source and dedicated CLI profiles are closed, then pass the
-source profile directory and the exact `--confirm-ah-cookie-copy` flag. The
-command uses the system `lsof` and `sqlite3`, requires compatible Firefox cookie
-schemas, copies the schema's ordinary non-ID cookie columns, replaces only
-`ah.be`/`*.ah.be` rows in one transaction, and prints a
-non-sensitive row-count receipt. On a first-time cookie import, initialize the
-dedicated profile once with `session status` or `session login` before running
-the importer. Run `session status` immediately afterwards; the live member
-query and usable `/mijnlijst` page, not the copy receipt, decide whether
-authentication works. The command fails closed instead of copying a whole
-profile or migrating between incompatible Firefox schemas.
+Authentication is established only through the visible browser login in the
+dedicated profile. The CLI never sees credentials or session values.
+`session status` uses the live member query and usable `/mijnlijst` page as the
+authentication gate.
 
 During automation, the browser adapter targets bounded pages on
 `https://www.ah.be/` only and fails closed when the site's accessible controls
@@ -185,9 +170,8 @@ denying it, refresh the pinned Chrome version there.
 The earlier fresh-profile session modes (guest consent bootstrap and HAR replay)
 were removed on 2026-08-01 after the live guest write was denied before the
 first click. The dedicated persistent profile replaces them: it is initialized
-once and then reused as the same returning browser. The optional scoped cookie
-import does not create throwaway profiles and does not claim that copying rows
-alone proves a usable session; `session status` remains the live gate.
+once and then reused as the same returning browser. Authentication is established
+only in that browser-owned profile, and `session status` remains the live gate.
 
 The write target is the AH page at `/mijnlijst`, which AH labels
 **Winkelmandje**. Turning that reviewed cart into an order remains a human
@@ -206,10 +190,10 @@ The CLI never replays captured traffic, copies a third-party client, or scrapes
 runtime bundles to discover mutations. Its three basket operations are narrow
 and pinned to the currently served AH `/mijnlijst` contract; schema drift fails
 closed. The dedicated profile is created empty and reused afterwards. It can
-earn its session in the visible login flow or receive only compatible AH-domain
-cookie rows through the explicit local import command. Raw session material
-never enters output, receipts, tests, intermediary files, command arguments, or
-Git.
+earn and retain its session through the visible browser login flow; the CLI does
+not inspect, copy, export, or migrate browser cookie or token data. Raw session
+material never enters output, receipts, tests, intermediary files, command
+arguments, or Git.
 
 The implementation is custom. Public grocery MCPs informed the generic safety
 shape—preview, exact SKU, explicit apply, reread—but no third-party AH client or
