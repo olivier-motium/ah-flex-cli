@@ -1,0 +1,6 @@
+interface:
+  display_name: "AH Flex"
+  short_description: "Build flexible AH Belgium grocery baskets"
+  default_prompt: "Use $ah-flex-cli to prepare a healthy, flexible AH Belgium basket and review every exact product before changing anything."
+policy:
+  allow_implicit_invocation: true

@@ -2,7 +2,23 @@
   "name": "ah-flex-cli",
   "version": "0.1.0",
   "private": true,
-  "description": "Agent-friendly, menu-free Albert Heijn basket preparation for personal use",
+  "description": "Agent-friendly, flexible Albert Heijn Belgium basket preparation",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olivier-motium/ah-flex-cli.git"
+  },
+  "homepage": "https://github.com/olivier-motium/ah-flex-cli#readme",
+  "bugs": {
+    "url": "https://github.com/olivier-motium/ah-flex-cli/issues"
+  },
+  "keywords": [
+    "albert-heijn",
+    "grocery",
+    "cli",
+    "agent-skill",
+    "meal-planning"
+  ],
   "type": "module",
   "bin": {
     "ah-flex": "src/cli.js"
