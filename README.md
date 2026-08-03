@@ -1,7 +1,8 @@
 # AH Flex CLI
 
 Build a flexible Albert Heijn Belgium basket with an AI agent, review every
-exact product, then add it to your AH basket in a browser you logged into once.
+exact product, then add it through a session you authorize once in your normal
+browser.
 
 AH Flex is built around **components, not a weekly menu**. It helps an agent
 combine pantry, freezer, and fresh food that can be used in several meals,
@@ -53,7 +54,8 @@ Requirements:
 - macOS or Linux
 - Git
 - Node.js 20 or newer
-- Firefox, Google Chrome, or Microsoft Edge for login and cart preparation
+- any normal browser for the one-time mobile login
+- optionally Firefox, Google Chrome, or Microsoft Edge for the legacy browser fallback
 - an AH Belgium account if you want to add products to a basket
 
 Install the CLI:
@@ -114,31 +116,40 @@ node src/cli.js cart apply basket.json
 The last command is a dry-run. It shows what would change without touching your
 AH basket.
 
-When the exact products and quantities are correct, apply them in a visible
-browser:
+Authorize the mobile session once. The CLI opens the OAuth page in your default
+browser, so Safari, Firefox, Chrome, Edge, and other normal browsers work:
 
 ```sh
-node src/cli.js cart apply basket.json --browser firefox --confirm-add
+node src/cli.js session login
+node src/cli.js session status
 ```
 
-Confirmed apply and `session login` require an interactive terminal so the
-visible browser can be handed to you. If the agent's shell is non-interactive,
-have it print the exact reviewed command and paste that command into your own
-terminal.
+The current AH callback uses the app's `appie://` URL. Keep the browser network
+log open with **Preserve log**, complete login, then paste the full
+`appie://login-exit?code=...&state=...` callback into the waiting terminal.
+The callback is exchanged immediately and is never printed or placed in shell
+history. `session login` must run in an interactive terminal; later commands do
+not need the browser.
 
-On the first confirmed run, AH Flex opens a dedicated browser profile. Log in
-there once; later runs reuse that browser-owned session. Chrome and Edge are
-also supported:
+After reviewing the dry-run, apply the basket directly:
 
 ```sh
-node src/cli.js session login --browser chrome
-node src/cli.js session status --browser chrome
-node src/cli.js cart apply basket.json --browser chrome --confirm-add
+node src/cli.js cart apply basket.json --confirm-add
 ```
 
-Each browser has a separate profile and therefore needs its own one-time login.
-Safari is not supported because Safari automation cannot reuse the human-owned
-persistent profile this workflow requires.
+The existing visible-browser implementation remains available as a fallback.
+An explicit `--browser` selects it for backward compatibility; the equivalent
+fully explicit commands are:
+
+```sh
+node src/cli.js session login --transport browser --browser chrome
+node src/cli.js session status --transport browser --browser chrome
+node src/cli.js cart apply basket.json --transport browser --browser chrome --confirm-add
+```
+
+The browser fallback uses a separate profile per browser and requires an
+interactive terminal. It supports Firefox, Chrome, and Edge; Safari is supported
+for the mobile OAuth login but not for automated browser fallback.
 
 ## What the agent should do
 
@@ -165,9 +176,10 @@ ah-flex schema
 ah-flex basket check basket.json [--json]
 ah-flex basket review basket.json --out review.html [--open]
 ah-flex search "kipfilet" [--limit 8] [--transport http|browser] [--browser firefox|chrome|edge] [--json]
-ah-flex session login [--browser firefox|chrome|edge]
-ah-flex session status [--browser firefox|chrome|edge] [--json]
-ah-flex cart apply basket.json [--browser firefox|chrome|edge] [--confirm-add] [--json]
+ah-flex session login [--transport mobile|browser] [--browser firefox|chrome|edge]
+ah-flex session status [--transport mobile|browser] [--browser firefox|chrome|edge] [--json]
+ah-flex session logout [--json]
+ah-flex cart apply basket.json [--transport mobile|browser] [--browser firefox|chrome|edge] [--confirm-add] [--json]
 ```
 
 `search` uses the cookie-free HTTP transport by default. The optional browser
@@ -177,15 +189,20 @@ transport retries automatically after an Access Denied response.
 ## Safety and privacy
 
 - Basket changes are dry-run by default and require `--confirm-add` in an
-  interactive terminal.
+  explicit reviewed command.
 - AH Flex validates the complete current basket before writing, sends each
   required mutation at most once, and reads the result back. An uncertain write
   returns a partial receipt instead of retrying.
 - Do not edit the same basket from another tab or device while a confirmed apply
   is running. AH does not expose transactional versioning for quantity updates.
-- Browser profiles live at `~/.ah-flex/{firefox,chrome,edge}-profile` with
-  private permissions. The CLI never reads, copies, prints, exports, or migrates
-  cookies, tokens, passwords, or browser databases.
+- The mobile session lives at `~/.ah-flex/mobile-session.json` in a mode-0700
+  directory and mode-0600 file. The CLI reads it only to authenticate API calls;
+  it never prints tokens or accepts them in arguments or environment variables.
+  `session logout` deletes it. Never share, inspect, commit, or attach this file.
+- Fallback browser profiles live at
+  `~/.ah-flex/{firefox,chrome,edge}-profile` with private permissions. The CLI
+  never reads, copies, prints, exports, or migrates their cookies, tokens,
+  passwords, or browser databases.
 - Automated page navigation is guarded to bounded `https://www.ah.be/` pages
   until verified basket readback.
 - Checkout, ordering, payment, accepting substitutions, and automatic product
@@ -193,9 +210,15 @@ transport retries automatically after an Access Denied response.
 - Prices, promotions, availability, and substitutions remain provisional until
   the final review on ah.be.
 
-The basket operations are narrow, pinned calls made inside AH's own authenticated
-`/mijnlijst` page. They are not a public or official AH API. Schema or page drift
-fails closed.
+The default authenticated path uses the undocumented Belgian mobile OAuth and
+API endpoints used by AH's app. The fallback makes narrow, pinned calls inside
+AH's authenticated `/mijnlijst` page. Neither is a public or official AH API;
+schema, endpoint, or page drift fails closed.
+
+The Belgian mobile protocol facts were independently implemented from the
+public [AH Belgium PKCE research gist](https://gist.github.com/moo-dy/e04ef59fa6ef2c73f01efa48ab925ccd),
+with [appie-go](https://github.com/gwillem/appie-go) as earlier ecosystem context.
+AH Flex does not copy source from the unlicensed gist.
 
 ## Development
 

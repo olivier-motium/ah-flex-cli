@@ -290,7 +290,7 @@ async function writeSessionAtPath(filePath, session, fsImpl, randomBytes) {
   await inspectOrCreatePrivateParent(path.dirname(filePath), fsImpl, { create: true });
   const existing = await inspectTarget(filePath, fsImpl);
   if (existing) {
-    assertRegularFile(existing, "file");
+    assertPrivateFile(existing, "file");
   }
 
   let temporaryPath = null;
@@ -333,7 +333,7 @@ async function deleteSessionAtPath(filePath, fsImpl) {
 
   const stat = await inspectTarget(filePath, fsImpl);
   if (!stat) return false;
-  assertRegularFile(stat, "file");
+  assertPrivateFile(stat, "file");
   try {
     await fsImpl.unlink(filePath);
   } catch (error) {

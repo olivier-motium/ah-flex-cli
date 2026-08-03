@@ -23,8 +23,10 @@ import {
 } from "./browser.js";
 import { searchProducts, TRANSPORTS } from "./search.js";
 import { writeReview } from "./report.js";
+import { createMobileRuntime } from "./mobile-runtime.js";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const AUTHENTICATED_TRANSPORTS = Object.freeze(["mobile", "browser"]);
 
 function usage() {
   return `ah-flex — flexible AH Belgium basket preparation
@@ -35,20 +37,18 @@ Usage:
   ah-flex basket check <basket.json> [--json]
   ah-flex basket review <basket.json> --out <review.html> [--open]
   ah-flex search <query> [--limit 8] [--transport http|browser] [--browser firefox|chrome|edge] [--json]
-  ah-flex session login [--browser firefox|chrome|edge]
-  ah-flex session status [--browser firefox|chrome|edge] [--json]
-  ah-flex cart apply <basket.json> [--browser firefox|chrome|edge] [--confirm-add] [--json]
+  ah-flex session login [--transport mobile|browser] [--browser firefox|chrome|edge]
+  ah-flex session status [--transport mobile|browser] [--browser firefox|chrome|edge] [--json]
+  ah-flex session logout [--json]
+  ah-flex cart apply <basket.json> [--transport mobile|browser] [--browser firefox|chrome|edge] [--confirm-add] [--json]
 
 Safety:
   cart apply is a dry-run unless --confirm-add is present. Confirmed writes stay
-  on authenticated /mijnlijst and use its pinned same-origin basket operations
-  through one dedicated persistent browser profile. A confirmed apply continues
-  immediately when that profile is authenticated; otherwise it opens login in
-  that same dedicated AH window and resumes this reviewed apply automatically.
-  'session login' is an optional setup or repair command. Authentication stays
-  in that browser-owned profile, which every later run reuses; the CLI does not
-  inspect or copy browser cookie, token, or profile database data. The live
-  member query must prove the authenticated account before any basket mutation.
+  on the exact reviewed products. The default mobile transport uses a session
+  authorized once through your normal browser; subsequent cart operations are
+  direct HTTPS calls and do not open a browser. The live member query must prove
+  the authenticated account before any basket mutation. An explicit --browser
+  keeps the dedicated-profile browser transport as a diagnostic fallback.
   Mutations are never retried automatically. Do not edit the same basket in
   another tab or device while confirmed apply is running.
   Search reads mimic a real browser over plain HTTPS (no cookies, no stored
@@ -78,6 +78,20 @@ function takeBrowserOption(args) {
   const name = takeFlag(args, "--browser", { value: true, defaultValue: "firefox" });
   const browser = resolveBrowser(name);
   return { name: browser.name, label: browser.label, specified: occurrences === 1 };
+}
+
+function takeAuthenticatedTransport(args, browser) {
+  const occurrences = args.filter((arg) => arg === "--transport").length;
+  if (occurrences > 1) throw new BasketError("--transport may be specified only once");
+  const explicit = takeFlag(args, "--transport", { value: true });
+  const transport = explicit ?? (browser.specified ? "browser" : "mobile");
+  if (!AUTHENTICATED_TRANSPORTS.includes(transport)) {
+    throw new BasketError(`--transport must be one of: ${AUTHENTICATED_TRANSPORTS.join(", ")}`);
+  }
+  if (transport === "mobile" && browser.specified) {
+    throw new BasketError("--browser is only supported with --transport browser");
+  }
+  return transport;
 }
 
 async function writeJson(filePath, value) {
@@ -116,6 +130,60 @@ function openLocalFile(filePath) {
   const args = process.platform === "win32" ? ["/c", "start", "", filePath] : [filePath];
   const child = spawn(command, args, { detached: true, stdio: "ignore" });
   child.unref();
+}
+
+function openExternalUrl(url) {
+  const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+    child.once("error", reject);
+  });
+}
+
+function readHiddenLine(prompt) {
+  if (!input.isTTY || typeof input.setRawMode !== "function") {
+    throw new BasketError("Mobile session login requires an interactive terminal");
+  }
+  output.write(prompt);
+  return new Promise((resolve, reject) => {
+    let value = "";
+    const wasRaw = input.isRaw;
+    const wasPaused = input.isPaused();
+    input.setEncoding("utf8");
+    input.setRawMode(true);
+    input.resume();
+    const cleanup = () => {
+      input.off("data", onData);
+      input.setRawMode(Boolean(wasRaw));
+      if (wasPaused) input.pause();
+      output.write("\n");
+    };
+    const onData = (chunk) => {
+      for (const character of chunk) {
+        if (character === "\u0003") {
+          cleanup();
+          reject(new BasketError("Mobile session login was cancelled"));
+          return;
+        }
+        if (character === "\r" || character === "\n") {
+          cleanup();
+          resolve(value.trim());
+          return;
+        }
+        if (character === "\u007f" || character === "\b") {
+          value = value.slice(0, -1);
+        } else {
+          value += character;
+        }
+      }
+    };
+    input.on("data", onData);
+  });
 }
 
 async function handleTemplate(args) {
@@ -199,16 +267,26 @@ async function handleSession(args) {
   const action = args.shift();
   const asJson = takeFlag(args, "--json");
   const browser = takeBrowserOption(args);
+  const transport = takeAuthenticatedTransport(args, browser);
   rejectUnknown(args);
   if (action === "status") {
-    const status = await sessionStatus({ browser: browser.name });
+    const status =
+      transport === "mobile"
+        ? await createMobileRuntime().status()
+        : await sessionStatus({ browser: browser.name });
     if (asJson) {
       console.log(JSON.stringify(status, null, 2));
       if (status.state !== "authenticated") process.exitCode = 1;
       return;
     }
     if (status.state === "authenticated") {
-      console.log("AH session is authenticated; 'cart apply --confirm-add' can use it.");
+      console.log(`AH ${transport} session is authenticated; 'cart apply --confirm-add' can use it.`);
+    } else if (transport === "mobile" && status.state === "missing") {
+      console.log("No AH mobile session exists. Run 'ah-flex session login' once in an interactive terminal.");
+    } else if (transport === "mobile" && status.state === "invalid") {
+      console.log("The stored AH mobile session is unsafe or invalid. Remove it with 'session logout', then log in again.");
+    } else if (transport === "mobile") {
+      console.log("The AH mobile session could not prove the member account. Run 'ah-flex session login' again.");
     } else if (status.state === "anonymous") {
       console.log("AH session is not authenticated. 'session login' is optional setup/repair; confirmed apply can open login in that dedicated profile.");
     } else if (status.state === "denied") {
@@ -219,9 +297,29 @@ async function handleSession(args) {
     if (status.state !== "authenticated") process.exitCode = 1;
     return;
   }
-  if (action !== "login") throw new BasketError("Use 'session login' or 'session status'");
+  if (action === "logout") {
+    if (transport !== "mobile") throw new BasketError("session logout applies only to the mobile transport");
+    const removed = await createMobileRuntime().logout();
+    const result = { transport: "mobile", state: "missing", authenticated: false, removed };
+    if (asJson) console.log(JSON.stringify(result, null, 2));
+    else console.log(removed ? "AH mobile session removed." : "No AH mobile session existed.");
+    return;
+  }
+  if (action !== "login") throw new BasketError("Use 'session login', 'session status', or 'session logout'");
   if (asJson) throw new BasketError("session login does not support --json because it requires an interactive browser handoff");
   if (!input.isTTY) throw new BasketError("session login requires an interactive terminal for the visible browser handoff");
+  if (transport === "mobile") {
+    const runtime = createMobileRuntime();
+    const request = runtime.beginLogin();
+    console.log("Opening the AH Belgium sign-in page in your default browser.");
+    console.log("Before signing in, open the browser Network panel and enable Preserve log.");
+    console.log("After login, copy the full failed appie://login-exit?... request. Do not paste it into chat.");
+    await openExternalUrl(request.authorizationUrl);
+    const callbackUrl = await readHiddenLine("Paste the full appie:// callback here (input is hidden), then press Enter: ");
+    await runtime.completeLogin(callbackUrl, request);
+    console.log("AH mobile session authenticated and stored privately. Future cart applies need no browser.");
+    return;
+  }
   console.log(`Opening the dedicated ah-flex ${browser.label} profile on ah.be.`);
   console.log("This profile is separate from your normal browser: an existing login there does not transfer.");
   console.log(`A dedicated ${browser.label} window opens on the ah.be login page; the first run starts empty and later runs reuse this profile (no everyday-browser data is imported). This command is optional setup or repair for future confirmed applies.`);
@@ -245,6 +343,7 @@ async function handleCart(args) {
   const confirmed = takeFlag(args, "--confirm-add");
   const asJson = takeFlag(args, "--json");
   const browser = takeBrowserOption(args);
+  const transport = takeAuthenticatedTransport(args, browser);
   rejectUnknown(args);
   const basket = await loadBasket(path.resolve(filePath));
   if (!confirmed) {
@@ -256,6 +355,31 @@ async function handleCart(args) {
       console.log("Run again with --confirm-add only after reviewing these exact lines.");
     }
     return;
+  }
+  if (transport === "mobile") {
+    try {
+      const receipt = await createMobileRuntime().applyBasket(basket);
+      if (asJson) console.log(JSON.stringify(receipt, null, 2));
+      else {
+        console.log("Fresh mobile API basket readback matched every exact product and quantity.");
+        for (const line of receipt.actions) console.log(formatReceiptAction(line));
+        for (const warning of receipt.warnings) console.log(`ATTENTION ${warning}`);
+        console.log("Open AH in your browser to review prices and complete checkout manually.");
+      }
+      return;
+    } catch (error) {
+      if (error.partialReceipt) {
+        if (asJson) console.error(JSON.stringify({ partial_receipt: error.partialReceipt }, null, 2));
+        else {
+          console.error("PARTIAL RECEIPT — one or more earlier lines may already have changed:");
+          for (const line of error.partialReceipt.actions) console.error(formatReceiptAction(line));
+          for (const row of error.partialReceipt.observed) {
+            console.error(`OBSERVED ${row.quantity ?? "?"} × ${row.url}`);
+          }
+        }
+      }
+      throw error;
+    }
   }
   if (!input.isTTY) {
     throw new BasketError("--confirm-add requires an interactive terminal so the verified browser can be handed to you");

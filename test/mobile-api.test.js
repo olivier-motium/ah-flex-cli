@@ -68,6 +68,16 @@ test("mobile GraphQL requests use the injected token, member guard, configurable
   assert.equal(JSON.parse(calls[0].init.body).operationName, "basket");
 });
 
+test("mobile member verification requires a strict authenticated member envelope", async () => {
+  const authenticated = clientWith(async () =>
+    jsonResponse({ data: { member: { analytics: { digimon: "fixture" }, __typename: "Member" } } }),
+  );
+  assert.deepEqual(await authenticated.verifyMember(), { authenticated: true });
+
+  const anonymous = clientWith(async () => jsonResponse({ data: { member: null } }));
+  await assert.rejects(() => anonymous.verifyMember(), /not authenticated/);
+});
+
 test("mobile transport rejects off-origin redirects, non-JSON bodies, and wrong envelopes", async () => {
   const redirected = clientWith(async () =>
     jsonResponse({ data: { basket: snapshot() } }, { url: "https://example.com/graphql" }),

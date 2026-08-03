@@ -7,3 +7,5 @@ review.html
 # Browser-owned session state. Never commit or inspect this directory.
 .browser-profile/
 
+# CLI-owned mobile or browser session state when a custom local state path is used.
+.ah-flex/

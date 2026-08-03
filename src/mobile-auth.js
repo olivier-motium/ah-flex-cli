@@ -16,6 +16,7 @@ export const MOBILE_REFRESH_URL = "https://api.ah.be/mobile-auth/v1/auth/token/r
 export const MOBILE_API_ORIGIN = "https://api.ah.be";
 export const DEFAULT_TOKEN_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024;
+export const MOBILE_APP_USER_AGENT = "Appie/8.22.3";
 
 const RANDOM_BYTES = 32;
 const MAX_TIMEOUT_MS = 10 * 60 * 1000;
@@ -350,10 +351,11 @@ async function postTokenRequest(endpoint, form, options = {}) {
         method: "POST",
         headers: {
           accept: "application/json",
-          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "content-type": "application/json",
+          "user-agent": MOBILE_APP_USER_AGENT,
         },
-        body: new URLSearchParams(form).toString(),
-        redirect: "manual",
+        body: JSON.stringify(form),
+        redirect: "error",
         signal: controller.signal,
       });
     } catch (error) {
@@ -452,7 +454,11 @@ function normalizeTokenResponse(payload, metadata, options = {}) {
 }
 
 export function createAuthorizationRequest(options = {}) {
-  const clientId = assertNonEmptyString(options.clientId ?? options.client_id, "client ID", MAX_CLIENT_ID_LENGTH);
+  const clientId = assertNonEmptyString(
+    options.clientId ?? options.client_id ?? MOBILE_TENANT,
+    "client ID",
+    MAX_CLIENT_ID_LENGTH,
+  );
   const tenant = assertTenant(options.tenant ?? MOBILE_TENANT);
   const redirectUri = assertRedirectUri(options.redirectUri ?? options.redirect_uri ?? MOBILE_REDIRECT_URI);
   const randomBytes = options.randomBytes ?? nodeRandomBytes;
@@ -463,7 +469,6 @@ export function createAuthorizationRequest(options = {}) {
   const state = base64UrlRandom(randomBytes, RANDOM_BYTES);
   const authorizationUrl = new URL(MOBILE_AUTHORIZE_URL);
   authorizationUrl.searchParams.set("client_id", clientId);
-  authorizationUrl.searchParams.set("tenant", tenant);
   authorizationUrl.searchParams.set("redirect_uri", redirectUri);
   authorizationUrl.searchParams.set("response_type", "code");
   authorizationUrl.searchParams.set("code_challenge", codeChallenge);
@@ -491,12 +496,9 @@ export async function exchangeAuthorizationCallback(callbackUrl, authorizationRe
   const payload = await postTokenRequest(
     MOBILE_TOKEN_URL,
     {
-      grant_type: "authorization_code",
+      clientId: pending.clientId,
       code: callback.code,
-      client_id: pending.clientId,
-      tenant: pending.tenant,
-      redirect_uri: pending.redirectUri,
-      code_verifier: pending.codeVerifier,
+      codeVerifier: pending.codeVerifier,
     },
     options,
   );
@@ -521,10 +523,8 @@ export async function refreshSession(session, options = {}) {
   const payload = await postTokenRequest(
     MOBILE_REFRESH_URL,
     {
-      grant_type: "refresh_token",
-      refresh_token: session.refresh_token,
-      client_id: session.client_id,
-      tenant: session.tenant,
+      clientId: session.client_id,
+      refreshToken: session.refresh_token,
     },
     options,
   );

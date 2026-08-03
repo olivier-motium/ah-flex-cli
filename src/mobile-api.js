@@ -12,14 +12,13 @@ import {
   reconcileTopUpCandidates,
   validateBasketMutationResponse,
 } from "./basket-graphql.js";
-import { countUnreadable, mapSearchProduct } from "./search-rsc.js";
+import { createMemberRequestBody } from "./member-query.js";
 
 export const MOBILE_API_ORIGIN = "https://api.ah.be";
 export const MOBILE_API_BASE_URL = MOBILE_API_ORIGIN;
 
 export const MOBILE_API_ENDPOINTS = Object.freeze({
   graphql: "/graphql",
-  productSearch: "/mobile-services/product/search/v2",
 });
 
 export const DEFAULT_MOBILE_TIMEOUT_MS = 15_000;
@@ -29,7 +28,7 @@ export const DEFAULT_MOBILE_MAX_BYTES = 512 * 1024;
 // verification can change this object at the integration boundary without
 // spreading app-version literals through request code.
 export const DEFAULT_MOBILE_APP_IDENTITY = Object.freeze({
-  application: "appie",
+  clientId: "appie-be",
   version: "8.22.3",
   userAgent: "Appie/8.22.3",
   headers: Object.freeze({ "User-Agent": "Appie/8.22.3" }),
@@ -265,65 +264,20 @@ function normalizeTokenSource(options) {
   return source;
 }
 
-function responseProductRows(payload) {
-  const arrays = [
-    payload.products,
-    payload._embedded?.products,
-    payload.data?.products,
-    payload.items,
-    ...(Array.isArray(payload.cards) ? payload.cards.map((card) => card?.products) : []),
-  ].filter(Array.isArray);
-  if (!arrays.length) throw new MobileApiError("AH mobile product search returned the wrong JSON envelope");
-  return arrays.flat();
-}
-
-function mobileWebPath(raw) {
-  const candidate = raw?.webPath ?? raw?.productUrl ?? raw?.url ?? raw?.link;
-  if (typeof candidate !== "string" || !candidate.trim()) return null;
-  try {
-    const url = new URL(candidate, "https://www.ah.be");
-    if (url.origin !== "https://www.ah.be") return null;
-    return url.pathname;
-  } catch {
-    return null;
+export function normalizeMobileMemberResponse(payload) {
+  if (!isObject(payload)) throw new MobileApiError("AH mobile member response was malformed");
+  if (Object.prototype.hasOwnProperty.call(payload, "errors")) {
+    if (!Array.isArray(payload.errors) || payload.errors.length > 0) {
+      throw new MobileApiError("AH mobile member query returned an error");
+    }
   }
-}
-
-function numericPrice(raw) {
-  const candidates = [
-    raw?.priceV2?.now?.amount,
-    raw?.price?.now?.amount,
-    raw?.price?.now,
-    raw?.price?.amount,
-    raw?.price,
-  ];
-  return candidates.find((value) => typeof value === "number" && Number.isFinite(value)) ?? null;
-}
-
-function mobileSearchRow(raw) {
-  if (!isObject(raw)) return null;
-  const product = isObject(raw.product) ? raw.product : raw;
-  const availability = product.availability ?? raw.availability ?? {
-    isOrderable: product.isOrderable ?? raw.isOrderable,
-    availabilityLabel: product.availabilityLabel ?? raw.availabilityLabel,
-  };
-  const priceLabels = product.priceV2?.promotionLabels ?? product.price?.promotionLabels ?? raw.promotionLabels;
-  const promotionLabels = Array.isArray(priceLabels)
-    ? priceLabels
-    : typeof product.promotion === "string" || typeof raw.promotion === "string"
-      ? [{ topText: product.promotion ?? raw.promotion }]
-      : undefined;
-  return {
-    webPath: mobileWebPath(product) ?? mobileWebPath(raw),
-    title: product.title ?? product.name ?? raw.title ?? raw.name ?? "",
-    priceV2: {
-      now: { amount: numericPrice(product) ?? numericPrice(raw) },
-      ...(promotionLabels ? { promotionLabels } : {}),
-    },
-    salesUnitSize:
-      product.salesUnitSize ?? product.unitSize ?? product.packageSize ?? raw.salesUnitSize ?? raw.unitSize ?? null,
-    availability,
-  };
+  if (!isObject(payload.data) || !Object.prototype.hasOwnProperty.call(payload.data, "member")) {
+    throw new MobileApiError("AH mobile member response had no member state");
+  }
+  if (!isObject(payload.data.member)) {
+    throw new MobileApiError("The stored AH mobile session is not authenticated");
+  }
+  return { authenticated: true };
 }
 
 function snapshotRows(snapshot, lines) {
@@ -420,6 +374,10 @@ export class MobileApiClient {
     return normalizeBasketGraphqlResponse(await this.graphql(createBasketQueryRequest()));
   }
 
+  async verifyMember() {
+    return normalizeMobileMemberResponse(await this.graphql({ body: createMemberRequestBody() }));
+  }
+
   async addBasketItems(items) {
     return validateBasketMutationResponse(
       await this.graphql(createBasketItemsAddRequest(items)),
@@ -434,33 +392,6 @@ export class MobileApiClient {
     );
   }
 
-  async searchProducts(query, options = {}) {
-    if (typeof query !== "string" || !query.trim()) throw new MobileApiError("Search query must be non-empty");
-    const limit = Math.min(Math.max(Number(options.limit ?? 8), 1), 25);
-    const url = new URL(MOBILE_API_ENDPOINTS.productSearch, MOBILE_API_ORIGIN);
-    url.searchParams.set("query", query.trim());
-    url.searchParams.set("sortOn", String(options.sortOn ?? "RELEVANCE"));
-    if (options.page !== undefined) url.searchParams.set("page", String(options.page));
-    if (options.size !== undefined) url.searchParams.set("size", String(options.size));
-    if (options.application !== undefined) url.searchParams.set("application", String(options.application));
-
-    const payload = await this.requestJson(`${url.pathname}${url.search}`, { method: "GET" });
-    const checkedAt = options.checkedAt ?? new Date().toISOString();
-    const products = [];
-    const seen = new Set();
-    for (const raw of responseProductRows(payload)) {
-      const product = mapSearchProduct(mobileSearchRow(raw), checkedAt);
-      if (!product || seen.has(product.url)) continue;
-      products.push(product);
-      seen.add(product.url);
-    }
-    const limited = products.slice(0, limit);
-    if (!limited.length) throw new MobileApiError("No usable products were present in the AH mobile search response");
-    if (countUnreadable(limited) === limited.length) {
-      throw new MobileApiError("Every product in the AH mobile search response had unreadable facts");
-    }
-    return limited;
-  }
 }
 
 export function createMobileApiClient(options) {

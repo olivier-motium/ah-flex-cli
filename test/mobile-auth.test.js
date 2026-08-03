@@ -58,10 +58,11 @@ function tokenResponse(overrides = {}) {
 test("authorization requests use the Belgian tenant, exact callback, random state, and S256 PKCE", () => {
   const request = requestFixture();
   const url = new URL(request.authorizationUrl);
+  const defaultRequest = createAuthorizationRequest({ randomBytes: deterministicRandomBytes() });
 
   assert.equal(url.origin + url.pathname, MOBILE_AUTHORIZE_URL);
   assert.equal(url.searchParams.get("client_id"), CLIENT_ID);
-  assert.equal(url.searchParams.get("tenant"), "appie-be");
+  assert.equal(url.searchParams.has("tenant"), false);
   assert.equal(url.searchParams.get("redirect_uri"), MOBILE_REDIRECT_URI);
   assert.equal(url.searchParams.get("response_type"), "code");
   assert.equal(url.searchParams.get("code_challenge_method"), "S256");
@@ -70,6 +71,8 @@ test("authorization requests use the Belgian tenant, exact callback, random stat
   assert.equal(request.redirectUri, MOBILE_REDIRECT_URI);
   assert.equal(request.codeVerifier.length, 43);
   assert.notEqual(request.state, request.codeVerifier);
+  assert.equal(defaultRequest.clientId, "appie-be");
+  assert.equal(new URL(defaultRequest.authorizationUrl).searchParams.get("client_id"), "appie-be");
 });
 
 test("callback validation fails closed for missing or mismatched state, callback errors, and incomplete callback URLs", () => {
@@ -108,15 +111,14 @@ test("authorization-code exchange sends the verifier exactly once and keeps toke
   assert.equal(calls[0].url, MOBILE_TOKEN_URL);
   assert.equal(new URL(calls[0].url).search, "");
   assert.equal(calls[0].init.method, "POST");
-  assert.equal(calls[0].init.redirect, "manual");
+  assert.equal(calls[0].init.redirect, "error");
   assert.ok(calls[0].init.signal instanceof AbortSignal);
-  const form = new URLSearchParams(calls[0].init.body);
-  assert.equal(form.get("grant_type"), "authorization_code");
-  assert.equal(form.get("code"), "one-time-code");
-  assert.equal(form.get("client_id"), CLIENT_ID);
-  assert.equal(form.get("tenant"), "appie-be");
-  assert.equal(form.get("redirect_uri"), MOBILE_REDIRECT_URI);
-  assert.equal(form.get("code_verifier"), request.codeVerifier);
+  assert.equal(calls[0].init.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    clientId: CLIENT_ID,
+    code: "one-time-code",
+    codeVerifier: request.codeVerifier,
+  });
   assert.equal(session.access_token, "access-secret");
   assert.equal(session.refresh_token, "refresh-secret");
   assert.equal(session.expires_at, "2026-08-03T11:00:00.000Z");
@@ -276,10 +278,9 @@ test("refresh rotates the stored refresh token and preserves safe metadata", asy
       },
     });
     const refreshed = await client.refresh();
-    const form = new URLSearchParams(call.init.body);
+    const body = JSON.parse(call.init.body);
     assert.equal(call.url, MOBILE_REFRESH_URL);
-    assert.equal(form.get("grant_type"), "refresh_token");
-    assert.equal(form.get("refresh_token"), "old-refresh-secret");
+    assert.deepEqual(body, { clientId: CLIENT_ID, refreshToken: "old-refresh-secret" });
     assert.equal(refreshed.access_token, "new-access-secret");
     assert.equal(refreshed.refresh_token, "new-refresh-secret");
     assert.equal((await store.read()).refresh_token, "new-refresh-secret");
@@ -295,8 +296,8 @@ test("strict token response validation rejects unknown fields without a downgrad
       exchangeAuthorizationCallback(callbackFor(request), request, {
         fetch: async (_url, init) => {
           calls += 1;
-          const form = new URLSearchParams(init.body);
-          assert.equal(form.get("code_verifier"), request.codeVerifier);
+          const body = JSON.parse(init.body);
+          assert.equal(body.codeVerifier, request.codeVerifier);
           return new Response(JSON.stringify({ ...tokenResponse(), unexpected: "value" }), { status: 200 });
         },
       }),
