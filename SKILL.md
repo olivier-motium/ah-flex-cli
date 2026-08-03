@@ -18,8 +18,10 @@ Treat the directory containing this `SKILL.md` as `<skill-root>`.
 3. Invoke commands as `node <skill-root>/src/cli.js ...`. Use `ah-flex ...`
    instead only when the package is already linked.
 
-Never inspect, copy, print, export, or persist browser cookies, tokens,
-credentials, profile databases, or session values.
+Never inspect, copy, print, export, or put credentials, callbacks, browser
+cookies, tokens, profile databases, or session values in prompts or command
+arguments. The CLI itself may read and rotate its private mobile session file;
+the agent must treat that file as opaque.
 
 ## Prepare a basket
 
@@ -44,25 +46,27 @@ credentials, profile databases, or session values.
 7. Present the exact products, pack quantities, estimated price, unresolved
    lines, and important assumptions to the user.
 
-Do not work around Access Denied responses, discover private endpoints, replay
-captured sessions, or retry mutations. Report the failure and leave the basket
-unchanged.
+Do not work around Access Denied responses, probe new private endpoints, replay
+captured browser sessions, or retry mutations. Use only the implemented mobile
+or browser transport, report the failure, and leave the basket unchanged.
 
 ## Apply only after review
 
 Treat a live cart change as a consequential external action. Obtain the user's
 current confirmation of the exact dry-run before invoking
-`cart apply basket.json --browser <browser> --confirm-add`.
+`cart apply basket.json --confirm-add`. The default mobile transport can run
+without a browser after one successful `session login`.
 
-Confirmed apply and `session login` require an interactive terminal for the
-visible browser handoff. If the current agent shell is non-interactive, print
-the exact reviewed command for the user to paste into their own terminal; do
-not weaken or bypass the terminal guard.
+`session login` requires an interactive terminal because the user must complete
+OAuth in their normal browser and paste the full `appie://login-exit` callback
+into the waiting process. Once that session exists, an approved confirmed apply
+may run non-interactively. Never ask the user to paste the callback into chat.
 
-Support `firefox`, `chrome`, and `edge`. The first confirmed apply opens the
-selected browser's dedicated persistent profile; let the user complete login in
-that window. Later runs reuse the browser-owned profile. `session login` is an
-optional setup or repair command, and `session status --json` proves readiness.
+Keep `--transport browser --browser firefox|chrome|edge` as the diagnostic
+fallback. Its first confirmed apply opens the selected dedicated persistent
+profile; let the user complete login there. `session status --json` proves the
+selected transport's readiness, and `session logout` removes only the mobile
+session.
 
 After apply, report the CLI receipt, including added, topped-up, already-present,
 kept-higher, unresolved, or uncertain lines. Never continue to checkout,
@@ -74,8 +78,9 @@ user.
 - Keep dry-run as the default.
 - Require exact product URLs and reviewed quantities; never auto-substitute.
 - Do not edit the same AH basket from another tab or device during apply.
-- Keep credentials and browser state out of prompts, files, logs, tests, Git,
-  and responses.
+- Keep credentials and browser state out of prompts, logs, tests, Git, and
+  responses. Only the CLI-owned mode-0600 mobile session file may persist mobile
+  tokens.
 - Treat prices, promotions, stock, and nutrition claims as current but
   provisional until the user reviews ah.be.
 - Use the local fixture tests for development. Never create an unrequested live
