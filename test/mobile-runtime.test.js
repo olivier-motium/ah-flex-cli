@@ -57,3 +57,38 @@ test("one callback exchange creates a reusable member-proved mobile session", as
   });
   assert.equal(calls.length, 3);
 });
+
+test("a failed member proof leaves no persisted mobile session", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ah-flex-mobile-runtime-rejected-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runtime = createMobileRuntime({
+    stateDir: path.join(root, ".ah-flex"),
+    fetchImpl: async (url) => {
+      if (url === MOBILE_TOKEN_URL) {
+        return jsonResponse({
+          access_token: "unproved-access",
+          refresh_token: "unproved-refresh",
+          token_type: "Bearer",
+          expires_in: 3600,
+        });
+      }
+      return jsonResponse({ data: { member: null } });
+    },
+    now: new Date("2026-08-03T10:00:00.000Z"),
+  });
+  const request = runtime.beginLogin();
+
+  await assert.rejects(
+    () =>
+      runtime.completeLogin(
+        `appie://login-exit?code=fixture-code&state=${encodeURIComponent(request.state)}`,
+        request,
+      ),
+    /not authenticated/,
+  );
+  assert.deepEqual(await runtime.status(), {
+    transport: "mobile",
+    state: "missing",
+    authenticated: false,
+  });
+});

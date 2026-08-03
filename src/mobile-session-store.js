@@ -414,19 +414,3 @@ export class MobileSessionStore {
     };
   }
 }
-
-export async function readSession(filePath, options = {}) {
-  return new MobileSessionStore(filePath, options).read();
-}
-
-export async function writeSession(filePath, session, options = {}) {
-  return new MobileSessionStore(filePath, options).write(session);
-}
-
-export async function deleteSession(filePath, options = {}) {
-  return new MobileSessionStore(filePath, options).delete();
-}
-
-export async function getSessionStatus(filePath, options = {}) {
-  return new MobileSessionStore(filePath, options).status(options);
-}

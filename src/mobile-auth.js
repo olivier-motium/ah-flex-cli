@@ -1,11 +1,7 @@
 import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from "node:crypto";
 import {
   MobileSessionStore,
-  deleteSession,
-  getSessionStatus,
-  readSession,
   validateSession,
-  writeSession,
 } from "./mobile-session-store.js";
 
 export const MOBILE_TENANT = "appie-be";
@@ -559,16 +555,8 @@ export function createMobileAuthClient(options = {}) {
     createAuthorizationRequest(requestOptions = {}) {
       return createAuthorizationRequest({ ...config, ...requestOptions });
     },
-    validateCallback(callbackUrl, authorizationRequest) {
-      return validateAuthorizationCallback(callbackUrl, authorizationRequest);
-    },
     exchangeCallback(callbackUrl, authorizationRequest, requestOptions = {}) {
       return exchangeAuthorizationCallback(callbackUrl, authorizationRequest, { ...config, ...requestOptions });
-    },
-    async completeLogin(callbackUrl, authorizationRequest, requestOptions = {}) {
-      const session = await this.exchangeCallback(callbackUrl, authorizationRequest, requestOptions);
-      await assertStore(store).write(session);
-      return session;
     },
     async refresh(requestOptions = {}) {
       const current = await assertStore(store).read();
@@ -599,9 +587,4 @@ export function createMobileAuthClient(options = {}) {
   return Object.freeze(client);
 }
 
-export const validateCallback = validateAuthorizationCallback;
-export const exchangeCallback = exchangeAuthorizationCallback;
-export const exchangeAuthorizationCode = exchangeAuthorizationCallback;
-export const refreshAccessToken = refreshSession;
-
-export { MobileSessionStore, deleteSession, getSessionStatus, readSession, validateSession, writeSession };
+export { MobileSessionStore, validateSession };

@@ -80,8 +80,17 @@ export function createMobileRuntime(options = {}) {
       return auth.createAuthorizationRequest();
     },
     async completeLogin(callbackUrl, request) {
-      cachedSession = await auth.completeLogin(callbackUrl, request);
-      await api.verifyMember();
+      const session = await auth.exchangeCallback(callbackUrl, request);
+      const verificationApi = createMobileApiClient({
+        fetchImpl: options.fetchImpl ?? globalThis.fetch,
+        accessToken: session.access_token,
+        timeoutMs: options.timeoutMs,
+        maxBytes: options.maxBytes,
+        identity: options.identity,
+      });
+      await verificationApi.verifyMember();
+      await auth.writeSession(session);
+      cachedSession = session;
       return { authenticated: true };
     },
     async logout() {

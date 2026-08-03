@@ -15,7 +15,6 @@ import {
 import { createMemberRequestBody } from "./member-query.js";
 
 export const MOBILE_API_ORIGIN = "https://api.ah.be";
-export const MOBILE_API_BASE_URL = MOBILE_API_ORIGIN;
 
 export const MOBILE_API_ENDPOINTS = Object.freeze({
   graphql: "/graphql",
